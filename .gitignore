@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Secrets — .env.example is committed, real keys are not
+.env
+.env.local
+.env*.local
+
+# Next.js / TypeScript build output
+.next/
+out/
+build/
+dist/
+next-env.d.ts
+*.tsbuildinfo
+
+# Qdrant data and Docker artifacts
+qdrant_storage/
+qdrant_data/
+storage/
+docker-compose.override.yml
+
+# Local run logs (append-only JSONL written by lib/logger.ts)
+logs/*.jsonl
+
+# OS / editor noise
+.DS_Store
+*.log
+.vscode/
+.idea/
