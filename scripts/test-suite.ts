@@ -1,4 +1,4 @@
-import { add, search, getAll, type Scope } from "../lib/memory";
+import { add, search, getAll, deleteMemory, type Scope } from "../lib/memory";
 import { qdrant, COLLECTION_NAME } from "../lib/clients";
 import { randomUUID } from "crypto";
 
@@ -317,6 +317,118 @@ async function testBranchingSupersession() {
   );
 }
 
+// Scope hierarchy: an unspecified agentId/runId is a wildcard for BOTH reads and
+// deletes, so a caller can delete exactly what it can see. Cross-userId stays strict.
+async function testScopeHierarchy() {
+  const base = testScope("case9-scope-hierarchy") as { userId: string };
+  const other = testScope("case9-other") as { userId: string };
+  const narrow = { userId: base.userId, agentId: "agent1" };
+
+  const stored = await add("My deadlift PR is 140kg.", narrow);
+  const id = stored.stored[0]?.id;
+  assertTrue("setup should store one agent-scoped fact", !!id, stored.stored, "one stored fact");
+
+  const broadList = await getAll({ userId: base.userId });
+  assertTrue(
+    "broad {userId} scope should READ an agent-scoped point",
+    broadList.some((m) => m.id === id),
+    broadList.map((m) => m.id),
+    `a list containing ${id}`
+  );
+
+  const wrongAgent = await deleteMemory(id as string, { userId: base.userId, agentId: "agent2" });
+  assertEqual(
+    "a different agentId must NOT delete another agent's point",
+    wrongAgent.status,
+    "scope_mismatch"
+  );
+
+  const crossUser = await deleteMemory(id as string, { userId: other.userId });
+  assertEqual("cross-userId delete must be refused", crossUser.status, "scope_mismatch");
+  assertTrue(
+    "a refusal must not leak the point's content",
+    !("content" in crossUser),
+    Object.keys(crossUser),
+    "no content field"
+  );
+
+  const broadDelete = await deleteMemory(id as string, { userId: base.userId });
+  assertEqual(
+    "broad {userId} scope SHOULD delete what it can see",
+    broadDelete.status,
+    "deleted"
+  );
+}
+
+// A -> B -> C. The hiding check is single-hop by design: A stays hidden because
+// B's row still claims it, regardless of B itself being superseded.
+async function testChainedSupersession() {
+  const scope = testScope("case10-chain");
+
+  const a = (await add("My deadlift PR is 140kg.", scope)).stored[0];
+  const b = (await add("Just hit a new deadlift PR, 145kg this time.", scope)).stored[0];
+  const c = (await add("New deadlift PR today, 150kg.", scope)).stored[0];
+
+  assertEqual("B should supersede A", b?.supersededMemoryId, a?.id);
+  assertEqual("C should supersede B", c?.supersededMemoryId, b?.id);
+
+  const live = (await getAll(scope)).map((m) => m.content);
+  assertTrue(
+    "only the newest fact (150kg) should be live",
+    live.length === 1 && live[0].includes("150kg"),
+    live,
+    "exactly one entry containing '150kg'"
+  );
+
+  const searched = (await search("what is my deadlift pr", scope)).map((r) => r.content);
+  assertTrue(
+    "search should return neither 140kg nor 145kg",
+    !searched.some((x) => x.includes("140kg") || x.includes("145kg")),
+    searched,
+    "no 140kg or 145kg entry"
+  );
+
+  const all = await getAll(scope, { includeSuperseded: true });
+  assertTrue(
+    "both older facts should still exist, flagged superseded",
+    all.filter((m) => m.superseded).length === 2 && all.length === 3,
+    all.map((m) => ({ content: m.content, superseded: m.superseded })),
+    "3 entries, 2 of them superseded"
+  );
+}
+
+// Deleting the successor must un-hide the original: nothing stays hidden once
+// the live claim against it is gone.
+async function testDeleteSuccessorUnhidesOriginal() {
+  const scope = testScope("case11-delete-successor");
+
+  const a = (await add("My current city is Chennai.", scope)).stored[0];
+  const b = (await add("Actually I moved to Bangalore.", scope)).stored[0];
+  assertEqual("B should supersede A", b?.supersededMemoryId, a?.id);
+
+  const before = (await getAll(scope)).map((m) => m.id);
+  assertTrue("A should be hidden while B exists", !before.includes(a?.id as string), before, `a list without ${a?.id}`);
+
+  const del = await deleteMemory(b?.id as string, scope);
+  assertEqual("deleting the successor should succeed", del.status, "deleted");
+
+  const after = await getAll(scope);
+  assertTrue(
+    "A should be visible again once its only superseder is gone",
+    after.length === 1 && after[0].id === a?.id && after[0].superseded === false,
+    after.map((m) => ({ id: m.id, content: m.content, superseded: m.superseded })),
+    `exactly one live entry with id ${a?.id}`
+  );
+
+  const searched = (await search("where do I live", scope)).map((r) => r.content);
+  assertTrue(
+    "search should surface the revived Chennai fact",
+    searched.some((c) => c.includes("Chennai")),
+    searched,
+    "an entry containing 'Chennai'"
+  );
+}
+
 async function testScopingIsolation() {
   const scopeA = testScope("case5-testA");
   const scopeB = testScope("case5-testB");
@@ -401,6 +513,9 @@ async function main() {
       testBranchingSupersession
     );
     await runTest("Scoping isolation: userB cannot see userA's memory", testScopingIsolation);
+    await runTest("Scope hierarchy: broad scope reads and deletes narrow-scoped points", testScopeHierarchy);
+    await runTest("Chained supersession: A -> B -> C leaves only C visible", testChainedSupersession);
+    await runTest("Delete the successor: removing B un-hides A", testDeleteSuccessorUnhidesOriginal);
     await runTest("No hallucinated values: vague number not invented", testNoHallucinatedValues);
     await runTest("BM25 contributes: exact term outranks sibling fact", testBM25ContributesOnExactTermQuery);
   } finally {

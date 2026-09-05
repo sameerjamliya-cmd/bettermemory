@@ -100,19 +100,38 @@ Also added:
 
 ## Testing
 
-`npm run test:suite` runs an 8-case regression suite against a live Qdrant
+`npm run test:suite` runs an 11-case regression suite against a live Qdrant
 and the real extraction model. Each run namespaces its scopes under a
 timestamped prefix and deletes exactly what it wrote, so repeated runs never
 pollute each other or touch real data.
 
 The cases cover: hash dedup, paraphrase handling, supersession on a genuine
 update, the vague-update safety rail, branching supersession, scope
-isolation, anti-hallucination, and BM25's contribution to ranking.
+isolation, scope hierarchy (a broad scope reads and deletes narrow-scoped
+points while cross-user deletion stays refused), chained supersession
+(A→B→C leaves only C visible), deleting a successor to un-hide its original,
+anti-hallucination, and BM25's contribution to ranking.
 
-Two of these are deliberately written to tolerate model nondeterminism. The
-paraphrase case passes whether the model skips the restatement or treats it
-as an update, but fails if the fact is lost or duplicated — because under
+The paraphrase case is deliberately written to tolerate model
+nondeterminism: it passes whether the model skips the restatement or treats
+it as an update, but fails if the fact is lost or duplicated — because under
 link-don't-delete, both classifications are safe and only loss is a bug.
+
+`npm run test:extraction` is a separate, non-gating measurement of
+extraction quality on scenarios where the model's judgement genuinely
+varies between runs. It reports pass RATES over N attempts (default 6,
+override with `ATTEMPTS`) and always exits 0. These live outside the suite
+on purpose: at the measured rate for the harder case, any pass/fail
+threshold fails more often than it succeeds, which would make the suite a
+coin flip rather than a contract. A rate that drops across several runs is
+the signal to investigate.
+
+Current baseline on `gpt-4o-mini`, one message updating two facts at once:
+
+| Scenario | Rate |
+| --- | --- |
+| Dimensions demonstrated in the prompt (location + job) | ~85% |
+| Dimensions not demonstrated (relationship + habit) | ~40-65% |
 
 `npm run test:memory` is an interactive console for manual exploration:
 add sentences one per line, then `list` / `list all` to see the scope,
@@ -128,6 +147,21 @@ add sentences one per line, then `list` / `list all` to see the scope,
   as an update rather than a duplicate — confirmed not fixable via prompt
   engineering alone after three attempts; accepted because the
   link-don't-delete architecture makes the consequence mild
+- A single message updating two facts at once does not reliably link both.
+  A state-rewrite rule with four worked examples (location, job/role,
+  living situation, possession) took the demonstrated dimensions from 0% to
+  ~85%, but the gains are per-dimension rather than cumulative: dimensions
+  with no worked example still fail regularly, and the ones that fail
+  hardest are those whose stored fact is not in substitutable state form
+  ("I have been single for about a year" has no slot to swap a value into).
+  Measured, not assumed — see `npm run test:extraction`. A stronger
+  extraction model closes most of this gap at roughly 10x per-token cost;
+  the default deliberately stays on gpt-4o-mini
+- Retrieval scores every memory independently against the query, so a fact
+  reachable only *through* another fact is not retrievable. Confirmed with
+  an ablation: two linked facts sharing no vocabulary with each other score
+  bit-for-bit identically whether or not the other is present. An
+  associative-linking mechanism is designed but deliberately not built
 - No `history()`/audit trail per memory
 - `findRelated()` (the context passed to extraction) does not filter
   superseded facts, so the model can see stale versions when deciding what
@@ -158,7 +192,8 @@ npm run test:suite
 
 | Command | What it does |
 | --- | --- |
-| `npm run test:suite` | 8-case regression suite, self-cleaning |
+| `npm run test:suite` | 11-case regression suite, self-cleaning |
+| `npm run test:extraction` | Extraction-quality rates (non-gating, always exits 0) |
 | `npm run test:memory` | Interactive console (add / list / delete / search) |
 | `npm run dev` | Next.js dev server |
 
