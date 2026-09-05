@@ -220,6 +220,32 @@ New Message: "finally cracked past that bench plateau today"
 WRONG: [{"content": "I cracked past my bench press plateau today.", "supersedes": "0", "skip": false, "skipReason": null}]  ← buries the only fact with a real number
 CORRECT: [{"content": "Broke past previous bench press plateau, exact new PR not stated.", "supersedes": null, "skip": false, "skipReason": null}]  ← old 80kg fact stays visible, vague fact stored alongside it
 
+When a message describes a change to an ongoing state — a location, job, role, relationship, living situation, possession, or habit — even if phrased as an event ("moved to", "switched to", "started", "got a new", "began") rather than a state, rewrite the extracted fact in the same current-state form as the existing memory it updates, so the connection is unambiguous.
+
+Example 1 — location:
+Existing Memory: [{"id": "0", "text": "My current city is Chennai."}]
+New Message: "I moved to Bangalore."
+WRONG: [{"content": "I moved to Bangalore.", "supersedes": null}]
+CORRECT: [{"content": "My current city is Bangalore.", "supersedes": "0"}]
+
+Example 2 — job/role:
+Existing Memory: [{"id": "0", "text": "I work at a design studio as a product designer."}]
+New Message: "I started at a fintech company as an engineer."
+WRONG: [{"content": "I started at a fintech company as an engineer.", "supersedes": null}]
+CORRECT: [{"content": "I work at a fintech company as an engineer.", "supersedes": "0"}]
+
+Example 3 — living situation:
+Existing Memory: [{"id": "0", "text": "I live with two roommates."}]
+New Message: "I just moved into my own place."
+WRONG: [{"content": "I just moved into my own place.", "supersedes": null}]
+CORRECT: [{"content": "I live alone now.", "supersedes": "0"}]
+
+Example 4 — possession:
+Existing Memory: [{"id": "0", "text": "I drive a Honda Civic."}]
+New Message: "Got a new car last week, a Tesla Model 3."
+WRONG: [{"content": "Got a new car last week, a Tesla Model 3.", "supersedes": null}]
+CORRECT: [{"content": "I drive a Tesla Model 3.", "supersedes": "0"}]
+
 If a fact you would extract is semantically equivalent to an existing memory shown above, with no new information, still include it in the output, but set "skip": true and "skipReason": "duplicate_of: <id>" (the id of the existing memory it duplicates). This is different from "supersedes": use "supersedes" when the new fact updates or changes an old value; use "skip": true when the new fact is just a restatement of information that's already fully captured, with nothing new to store. When "skip" is true, "supersedes" must be null and "skipReason" must be set; when "skip" is false, "skipReason" must be null.
 
 3. Extract each distinct fact as exactly one sentence. Do not split one fact into multiple entries, and do not merge two distinct facts into one.
@@ -239,6 +265,14 @@ Existing Memories: [{"id": "0", "text": "My favorite language for backend work u
 New Message: "I go to the gym 5 days a week."
 WRONG Output: [{"content": "I go to the gym 5 days a week.", "supersedes": null, "skip": false, "skipReason": null}, {"content": "My favorite language is TypeScript.", "supersedes": null, "skip": false, "skipReason": null}]  ← TypeScript fact was NOT in this New Message, it leaked in from Existing Memories
 CORRECT Output: [{"content": "I go to the gym 5 days a week.", "supersedes": null, "skip": false, "skipReason": null}]
+
+CRITICAL — Do not resolve pronouns, ambiguous references, or implied subjects using content from Existing Memories. If the New Message contains a pronoun ("his", "her", "their", "it") or an ambiguous reference whose subject is not explicitly stated in the New Message itself, extract the fact with the reference intact, exactly as written — do not substitute in a name or detail pulled from Existing Memories, even if it seems like an obvious, helpful resolution.
+
+Example:
+Existing Memory: [{"id": "0", "text": "Sameer's favorite color is green."}]
+New Message: "Saw someone wearing his signature color today, didn't say hi."
+WRONG: [{"content": "Saw someone wearing Sameer's favorite color today, didn't say hi.", "supersedes": null}]  ← "Sameer" was never stated in the New Message, only inferred from Existing Memories
+CORRECT: [{"content": "Saw someone wearing his signature color today, didn't say hi.", "supersedes": null}]  ← reference left exactly as stated, unresolved
 
 Example — do not invent unstated values:
 New Message: "broke through a plateau today, finally past 145 on the lift"
@@ -670,10 +704,14 @@ export async function deleteMemory(id: string, scope: Scope): Promise<DeleteResu
     agentId: typeof payload.agentId === "string" ? payload.agentId : null,
     runId: typeof payload.runId === "string" ? payload.runId : null,
   };
+  // Hierarchical, matching read semantics: userId must match exactly, but an
+  // unspecified agentId/runId in the caller's scope is a wildcard, exactly as
+  // scopeFilter() treats it for search()/getAll(). A caller can therefore delete
+  // anything it can see — and nothing it cannot. Cross-userId remains strict.
   const matchesScope =
     pointScope.userId === validatedScope.userId &&
-    pointScope.agentId === validatedScope.agentId &&
-    pointScope.runId === validatedScope.runId;
+    (validatedScope.agentId === null || pointScope.agentId === validatedScope.agentId) &&
+    (validatedScope.runId === null || pointScope.runId === validatedScope.runId);
 
   if (!matchesScope) {
     const result: DeleteResult = { status: "scope_mismatch", id };
