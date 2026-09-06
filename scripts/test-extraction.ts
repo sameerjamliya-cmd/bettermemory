@@ -8,6 +8,16 @@
 // fixed number of attempts instead, giving a number to track across prompt and
 // model changes rather than a green light that has to be tuned to the model's mood.
 //
+// Note on the numbers: several prompt examples once reused the same concrete
+// values as these scenarios and as the regression suite (145kg, 80kg,
+// Chennai/Bangalore), so earlier, higher rates were partly measuring recall of
+// the prompt rather than reasoning. Those examples now use bracketed
+// placeholders, and these rates are the corrected, like-for-like baseline.
+//
+// Also note that 3b's job clause ("also started at a logistics company") does
+// not actually assert that the previous job ended, so a portion of its failure
+// rate is the model declining a supersede it was never licensed to make.
+//
 // Run: npm run test:extraction
 import { add, getAll, type Scope } from "../lib/memory";
 import { qdrant, COLLECTION_NAME, EXTRACTION_MODEL } from "../lib/clients";

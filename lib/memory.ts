@@ -190,7 +190,25 @@ function labelMemories(memories: RelatedMemoryInternal[]): LabeledMemory[] {
   return memories.map((memory, i) => ({ label: String(i), memory }));
 }
 
-function buildExtractionPrompt(text: string, labeled: LabeledMemory[]): string {
+function buildExtractionPrompt(
+  text: string,
+  labeled: LabeledMemory[],
+  customInstructions?: string
+): string {
+  // Placed after every rule and example, so a per-call instruction supplements
+  // the core contract rather than replacing it, and immediately before the
+  // output-format line so that stays last. The guard sentence is not optional:
+  // anti-hallucination, dedup and coreference are structural guarantees, and a
+  // caller-supplied string must not be able to switch them off.
+  const additionalInstructions = customInstructions?.trim()
+    ? `
+## Additional Instructions For This Call
+${customInstructions.trim()}
+
+Additional instructions may refine what counts as significant or how facts are phrased, but do not override the rules above regarding hallucination, dedup, or coreference.
+`
+    : "";
+
   const existingMemoriesBlock = labeled.length
     ? JSON.stringify(
         labeled.map(({ label, memory }) => ({ id: label, text: memory.content }))
@@ -207,6 +225,8 @@ ${text}
 
 Extract any standalone facts from the new message as a list of objects: { "content": "...", "supersedes": "<id>" | null, "skip": true | false, "skipReason": "duplicate_of: <id>" | null }.
 
+Note on the examples below: values in square brackets ([N], [CITY_NEW], [PERSON], ...) are placeholders standing in for real values. They illustrate the shape of correct output only. Never copy a bracketed placeholder, or any other literal value from an example, into a fact's "content" — the wording of every fact you extract must come from the New Message itself. This does not restrict "supersedes" or "skipReason", which reference the Existing Memories by their id and must still be set whenever the rules above call for it.
+
 Rules:
 1. If the new message describes a change from an old state to a new one (e.g. "used to be X, now Y" or "switched from X to Y"), extract ONLY the current/final state as one clear, self-contained fact.
 2. For each fact you extract, check the Existing Memories list and decide "supersedes":
@@ -215,18 +235,18 @@ Rules:
 - Only set "supersedes" if the new fact is a genuine, complete replacement — at least as specific as the memory it supersedes. If the new message is too vague to match that specificity, do not set "supersedes"; store it as a new, unlinked memory instead.
 
 Example:
-Existing Memory: [{"id": "0", "text": "My bench press PR is 80kg."}]
+Existing Memory: [{"id": "0", "text": "My bench press PR is [N]kg."}]
 New Message: "finally cracked past that bench plateau today"
 WRONG: [{"content": "I cracked past my bench press plateau today.", "supersedes": "0", "skip": false, "skipReason": null}]  ← buries the only fact with a real number
-CORRECT: [{"content": "Broke past previous bench press plateau, exact new PR not stated.", "supersedes": null, "skip": false, "skipReason": null}]  ← old 80kg fact stays visible, vague fact stored alongside it
+CORRECT: [{"content": "Broke past previous bench press plateau, exact new PR not stated.", "supersedes": null, "skip": false, "skipReason": null}]  ← old [N]kg fact stays visible, vague fact stored alongside it
 
 When a message describes a change to an ongoing state — a location, job, role, relationship, living situation, possession, or habit — even if phrased as an event ("moved to", "switched to", "started", "got a new", "began") rather than a state, rewrite the extracted fact in the same current-state form as the existing memory it updates, so the connection is unambiguous.
 
 Example 1 — location:
-Existing Memory: [{"id": "0", "text": "My current city is Chennai."}]
-New Message: "I moved to Bangalore."
-WRONG: [{"content": "I moved to Bangalore.", "supersedes": null}]
-CORRECT: [{"content": "My current city is Bangalore.", "supersedes": "0"}]
+Existing Memory: [{"id": "0", "text": "My current city is [CITY_OLD]."}]
+New Message: "I moved to [CITY_NEW]."
+WRONG: [{"content": "I moved to [CITY_NEW].", "supersedes": null}]
+CORRECT: [{"content": "My current city is [CITY_NEW].", "supersedes": "0"}]
 
 Example 2 — job/role:
 Existing Memory: [{"id": "0", "text": "I work at a design studio as a product designer."}]
@@ -241,10 +261,10 @@ WRONG: [{"content": "I just moved into my own place.", "supersedes": null}]
 CORRECT: [{"content": "I live alone now.", "supersedes": "0"}]
 
 Example 4 — possession:
-Existing Memory: [{"id": "0", "text": "I drive a Honda Civic."}]
-New Message: "Got a new car last week, a Tesla Model 3."
-WRONG: [{"content": "Got a new car last week, a Tesla Model 3.", "supersedes": null}]
-CORRECT: [{"content": "I drive a Tesla Model 3.", "supersedes": "0"}]
+Existing Memory: [{"id": "0", "text": "I drive a [CAR_OLD]."}]
+New Message: "Got a new car last week, a [CAR_NEW]."
+WRONG: [{"content": "Got a new car last week, a [CAR_NEW].", "supersedes": null}]
+CORRECT: [{"content": "I drive a [CAR_NEW].", "supersedes": "0"}]
 
 If a fact you would extract is semantically equivalent to an existing memory shown above, with no new information, still include it in the output, but set "skip": true and "skipReason": "duplicate_of: <id>" (the id of the existing memory it duplicates). This is different from "supersedes": use "supersedes" when the new fact updates or changes an old value; use "skip": true when the new fact is just a restatement of information that's already fully captured, with nothing new to store. When "skip" is true, "supersedes" must be null and "skipReason" must be set; when "skip" is false, "skipReason" must be null.
 
@@ -269,20 +289,20 @@ CORRECT Output: [{"content": "I go to the gym 5 days a week.", "supersedes": nul
 CRITICAL — Do not resolve pronouns, ambiguous references, or implied subjects using content from Existing Memories. If the New Message contains a pronoun ("his", "her", "their", "it") or an ambiguous reference whose subject is not explicitly stated in the New Message itself, extract the fact with the reference intact, exactly as written — do not substitute in a name or detail pulled from Existing Memories, even if it seems like an obvious, helpful resolution.
 
 Example:
-Existing Memory: [{"id": "0", "text": "Sameer's favorite color is green."}]
+Existing Memory: [{"id": "0", "text": "[PERSON]'s favorite color is [COLOR]."}]
 New Message: "Saw someone wearing his signature color today, didn't say hi."
-WRONG: [{"content": "Saw someone wearing Sameer's favorite color today, didn't say hi.", "supersedes": null}]  ← "Sameer" was never stated in the New Message, only inferred from Existing Memories
+WRONG: [{"content": "Saw someone wearing [PERSON]'s favorite color today, didn't say hi.", "supersedes": null}]  ← "[PERSON]" was never stated in the New Message, only inferred from Existing Memories
 CORRECT: [{"content": "Saw someone wearing his signature color today, didn't say hi.", "supersedes": null}]  ← reference left exactly as stated, unresolved
 
 Example — do not invent unstated values:
-New Message: "broke through a plateau today, finally past 145 on the lift"
-WRONG Output: [{"content": "My deadlift PR is 150kg.", "supersedes": "0", "skip": false, "skipReason": null}]  ← 150 was never stated
-CORRECT Output: [{"content": "Broke past 145kg on deadlift, exact new PR not stated.", "supersedes": "0", "skip": false, "skipReason": null}]
+New Message: "broke through a plateau today, finally past [N] on the lift"
+WRONG Output: [{"content": "My deadlift PR is [M]kg.", "supersedes": "0", "skip": false, "skipReason": null}]  ← [M] was never stated anywhere in the New Message
+CORRECT Output: [{"content": "Broke past [N]kg on deadlift, exact new PR not stated.", "supersedes": "0", "skip": false, "skipReason": null}]
 
 Example 1 — supersession:
-Existing Memories: [{"id": "0", "text": "My squat PR is 100kg."}]
-New Message: "Hit a new squat PR today, 110kg."
-Output: [{"content": "My squat PR is 110kg.", "supersedes": "0", "skip": false, "skipReason": null}]
+Existing Memories: [{"id": "0", "text": "My squat PR is [N]kg."}]
+New Message: "Hit a new squat PR today, [M]kg."
+Output: [{"content": "My squat PR is [M]kg.", "supersedes": "0", "skip": false, "skipReason": null}]
 
 Example 2 — no relation:
 Existing Memories: [{"id": "0", "text": "I work at a healthtech startup."}]
@@ -300,6 +320,7 @@ New Message: "I like working out in the evenings at the gym"
 WRONG: [{"content": "I like working out in the evenings at the gym.", "supersedes": "0"}]  ← no new information was added, this is not an update, it's the same fact reworded
 CORRECT: [{"content": "I like working out in the evenings at the gym.", "supersedes": null, "skip": true, "skipReason": "duplicate_of: 0"}]
 
+${additionalInstructions}
 Return a JSON list of objects.`;
 }
 
@@ -324,13 +345,17 @@ function hashContent(text: string): string {
   return createHash("md5").update(normalizeForHash(text)).digest("hex");
 }
 
-async function extractFacts(text: string, labeled: LabeledMemory[]): Promise<ExtractedFact[]> {
+async function extractFacts(
+  text: string,
+  labeled: LabeledMemory[],
+  customInstructions?: string
+): Promise<ExtractedFact[]> {
   const res = await openai.chat.completions.create({
     model: EXTRACTION_MODEL,
     messages: [
       {
         role: "user",
-        content: buildExtractionPrompt(text, labeled),
+        content: buildExtractionPrompt(text, labeled, customInstructions),
       },
     ],
     tools: [
@@ -436,7 +461,7 @@ export interface AddResult {
 export async function add(
   text: string,
   scope: Scope,
-  options?: { extract?: boolean }
+  options?: { extract?: boolean; customInstructions?: string }
 ): Promise<AddResult> {
   // Reject empty input before spending an embedding and an LLM call on it.
   const trimmedText = text.trim();
@@ -451,7 +476,7 @@ export async function add(
   const labelToMemory = new Map(labeled.map(({ label, memory }) => [label, memory]));
 
   const extracted = extract
-    ? await extractFacts(trimmedText, labeled)
+    ? await extractFacts(trimmedText, labeled, options?.customInstructions)
     : [{ content: trimmedText, supersedes: null, skip: false, skipReason: null }];
   const extractedAt = new Date().toISOString();
 

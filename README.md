@@ -130,8 +130,20 @@ Current baseline on `gpt-4o-mini`, one message updating two facts at once:
 
 | Scenario | Rate |
 | --- | --- |
-| Dimensions demonstrated in the prompt (location + job) | ~85% |
-| Dimensions not demonstrated (relationship + habit) | ~40-65% |
+| Dimensions demonstrated in the prompt (location + job) | ~50% |
+| Dimensions not demonstrated (relationship + habit) | ~65-100% |
+
+These figures replace an earlier, higher baseline (~85% / ~40-65%) that was
+partly measuring prompt contamination rather than reasoning. Several prompt
+examples used the same concrete values as the test inputs — the
+anti-hallucination example contained `145kg`, which is the exact number the
+anti-hallucination test asserts on, and the vague-update, location, possession
+and coreference examples reused `80kg`, Chennai/Bangalore, Honda/Tesla and a
+person's name that the tests also used. Those examples now use bracketed
+placeholders (`[N]kg`, `[CITY_NEW]`, `[PERSON]`), so a value echoed from an
+example is immediately visible in output instead of looking plausible. The
+numbers moved when the contamination was removed; the earlier ones were not a
+like-for-like better result.
 
 `npm run test:memory` is an interactive console for manual exploration:
 add sentences one per line, then `list` / `list all` to see the scope,
@@ -149,14 +161,19 @@ add sentences one per line, then `list` / `list all` to see the scope,
   link-don't-delete architecture makes the consequence mild
 - A single message updating two facts at once does not reliably link both.
   A state-rewrite rule with four worked examples (location, job/role,
-  living situation, possession) took the demonstrated dimensions from 0% to
-  ~85%, but the gains are per-dimension rather than cumulative: dimensions
-  with no worked example still fail regularly, and the ones that fail
-  hardest are those whose stored fact is not in substitutable state form
-  ("I have been single for about a year" has no slot to swap a value into).
+  living situation, possession) helps, but the dominant factor turned out
+  not to be the examples at all: it is whether the new message *signals
+  that the old fact no longer holds*. Measured in isolation against the
+  same stored job fact, "I started at a logistics company" links 0/5 —
+  because starting a job does not assert that the previous one ended —
+  while "I switched to", "I left X and started at Y" and "I now work at"
+  each link 5/5. The same applies in reverse to location: "I relocated to
+  Hyderabad" links 5/5, but "I stayed in Hyderabad this week" links 0/5.
+  The model is arguably right to refuse the non-exclusive cases, so part of
+  the measured failure rate is a flawed test input rather than a defect.
   Measured, not assumed — see `npm run test:extraction`. A stronger
-  extraction model closes most of this gap at roughly 10x per-token cost;
-  the default deliberately stays on gpt-4o-mini
+  extraction model closes much of the remainder at roughly 10x per-token
+  cost; the default deliberately stays on gpt-4o-mini
 - Retrieval scores every memory independently against the query, so a fact
   reachable only *through* another fact is not retrievable. Confirmed with
   an ablation: two linked facts sharing no vocabulary with each other score
