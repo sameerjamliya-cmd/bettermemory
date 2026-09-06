@@ -50,6 +50,13 @@ function validateScope(scope: Scope): ValidatedScope {
   return { userId, agentId, runId };
 }
 
+export type MemoryType = "fact" | "procedural";
+
+// Points written before `type` existed have no such field. Filtering with
+// must_not on the procedural value (rather than must type == "fact") keeps
+// those legacy points visible, since a missing field cannot match.
+const EXCLUDE_PROCEDURAL = { key: "type", match: { value: "procedural" as const } };
+
 function scopeFilter(scope: ValidatedScope) {
   const must: { key: string; match: { value: string } }[] = [
     { key: "userId", match: { value: scope.userId } },
@@ -88,7 +95,8 @@ async function findRelated(text: string, scope: ValidatedScope): Promise<Related
   const vector = await embed(text);
   const res = await qdrant.query(COLLECTION_NAME, {
     query: vector,
-    filter: scopeFilter(scope),
+    // Procedural memories are instructions, not source material for extraction.
+    filter: { ...scopeFilter(scope), must_not: [EXCLUDE_PROCEDURAL] },
     limit: 5,
     with_payload: true,
   });
@@ -250,8 +258,8 @@ CORRECT: [{"content": "My current city is [CITY_NEW].", "supersedes": "0"}]
 
 Example 2 — job/role:
 Existing Memory: [{"id": "0", "text": "I work at a design studio as a product designer."}]
-New Message: "I started at a fintech company as an engineer."
-WRONG: [{"content": "I started at a fintech company as an engineer.", "supersedes": null}]
+New Message: "I now work at a fintech company as an engineer."
+WRONG: [{"content": "I now work at a fintech company as an engineer.", "supersedes": null}]
 CORRECT: [{"content": "I work at a fintech company as an engineer.", "supersedes": "0"}]
 
 Example 3 — living situation:
@@ -535,6 +543,7 @@ export async function add(
             content: fact.content,
             source: trimmedText,
             extractedAt,
+            type: "fact",
             supersededMemoryId,
             userId: validatedScope.userId,
             agentId: validatedScope.agentId,
@@ -569,7 +578,7 @@ export async function search(
   const vector = await embed(query);
   const res = await qdrant.query(COLLECTION_NAME, {
     query: vector,
-    filter: scopeFilter(validatedScope),
+    filter: { ...scopeFilter(validatedScope), must_not: [EXCLUDE_PROCEDURAL] },
     limit: HYBRID_CANDIDATE_POOL,
     with_payload: true,
   });
@@ -651,7 +660,7 @@ export async function getAll(
   let offset: string | number | undefined | null = undefined;
   do {
     const page = await qdrant.scroll(COLLECTION_NAME, {
-      filter: scopeFilter(validatedScope),
+      filter: { ...scopeFilter(validatedScope), must_not: [EXCLUDE_PROCEDURAL] },
       limit: SCROLL_PAGE_SIZE,
       offset: offset ?? undefined,
       with_payload: true,
@@ -686,6 +695,91 @@ export async function getAll(
 
   await logEvent({ call: "getAll", input: { scope, options }, output: results });
 
+  return results;
+}
+
+export interface ProceduralMemory {
+  id: string;
+  content: string;
+  createdAt: string;
+  type: "procedural";
+}
+
+// Procedural memory: an instruction the agent should follow, not a fact about
+// the user. Stored verbatim — no extraction call, no dedup, no supersession —
+// because rewriting an instruction risks changing what it tells the agent to do,
+// and two similar instructions are not necessarily redundant. Kept in the same
+// collection, separated by the `type` payload field and filtered out of
+// search()/getAll()/the extraction context at the Qdrant query level.
+export async function addProcedural(
+  instruction: string,
+  scope: Scope
+): Promise<ProceduralMemory> {
+  const trimmed = instruction.trim();
+  if (trimmed === "") throw new Error('Invalid input: "instruction" must not be empty.');
+
+  const validatedScope = validateScope(scope);
+  await ensureCollection();
+
+  const createdAt = new Date().toISOString();
+  const vector = await embed(trimmed);
+  const id = randomUUID();
+  await qdrant.upsert(COLLECTION_NAME, {
+    wait: true,
+    points: [
+      {
+        id,
+        vector,
+        payload: {
+          content: trimmed,
+          source: trimmed,
+          extractedAt: createdAt,
+          type: "procedural",
+          supersededMemoryId: null,
+          userId: validatedScope.userId,
+          agentId: validatedScope.agentId,
+          runId: validatedScope.runId,
+        },
+      },
+    ],
+  });
+
+  const result: ProceduralMemory = { id, content: trimmed, createdAt, type: "procedural" };
+  await logEvent({ call: "addProcedural", input: { instruction, scope }, output: result });
+  return result;
+}
+
+// Every procedural memory in a scope, newest first. Unranked by design: these
+// are instructions to be followed, not candidates to be matched against a query,
+// so there is nothing to score them against.
+export async function getProcedural(scope: Scope): Promise<ProceduralMemory[]> {
+  const validatedScope = validateScope(scope);
+  await ensureCollection();
+
+  const results: ProceduralMemory[] = [];
+  let offset: string | number | undefined | null = undefined;
+  do {
+    const page = await qdrant.scroll(COLLECTION_NAME, {
+      filter: { must: [...scopeFilter(validatedScope).must, EXCLUDE_PROCEDURAL] },
+      limit: SCROLL_PAGE_SIZE,
+      offset: offset ?? undefined,
+      with_payload: true,
+      with_vector: false,
+    });
+    for (const point of page.points) {
+      results.push({
+        id: String(point.id),
+        content: String(point.payload?.content ?? ""),
+        createdAt: String(point.payload?.extractedAt ?? ""),
+        type: "procedural",
+      });
+    }
+    offset = page.next_page_offset as typeof offset;
+  } while (offset !== null && offset !== undefined);
+
+  results.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+  await logEvent({ call: "getProcedural", input: { scope }, output: results });
   return results;
 }
 

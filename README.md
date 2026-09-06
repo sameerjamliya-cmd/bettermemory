@@ -130,8 +130,25 @@ Current baseline on `gpt-4o-mini`, one message updating two facts at once:
 
 | Scenario | Rate |
 | --- | --- |
-| Dimensions demonstrated in the prompt (location + job) | ~50% |
-| Dimensions not demonstrated (relationship + habit) | ~65-100% |
+| `3b-explicit` — clear departure signal ("relocated to", "switched to") | 6/6 |
+| `3b-ambiguous` — no departure signal ("stayed in", "also started at") | 0/6 |
+| `3c` — dimensions with no worked example (relationship + habit) | ~50% |
+
+The first two were previously one blended number, and splitting them is what
+made the result interpretable. The dominant factor in whether an update links
+turned out not to be the dimension or how well the prompt demonstrates it, but
+whether the message signals that the **old fact stopped holding**. Measured in
+isolation against the same stored job fact, "I started at a logistics company"
+links 0/5, while "I switched to", "I left X and started at Y" and "I now work
+at" each link 5/5 — and the same holds in reverse for location, where
+"I relocated to Hyderabad" links 5/5 but "I stayed in Hyderabad this week"
+links 0/5.
+
+So `3b-ambiguous` scoring 0 is not a defect. "I also started at a logistics
+company" does not assert the previous job ended — people hold two jobs — and
+superseding there would hide a fact the user never retracted. A *high* rate on
+that row would be the worse outcome. `3b-explicit` is the real capability
+measure and should stay high.
 
 These figures replace an earlier, higher baseline (~85% / ~40-65%) that was
 partly measuring prompt contamination rather than reasoning. Several prompt
@@ -149,6 +166,29 @@ like-for-like better result.
 add sentences one per line, then `list` / `list all` to see the scope,
 `delete <id>` to remove a memory, and a search query at the end.
 
+## Procedural memory
+
+Facts describe the user; procedural memories are instructions the agent should
+follow. They live in the same collection, separated by a `type` payload field,
+and travel a deliberately minimal path:
+
+- `addProcedural(instruction, scope)` stores the text **verbatim** — no
+  extraction call, no dedup, no supersession. Rewriting an instruction risks
+  changing what it tells the agent to do, and two similar instructions are not
+  necessarily redundant, so neither mechanism is a safe default here.
+- `getProcedural(scope)` returns all of them, newest first, unranked and
+  paginated. There is no query to score them against: instructions are to be
+  followed, not matched.
+- `search()`, `getAll()` and the extraction context inside `add()` all exclude
+  `type: "procedural"` at the Qdrant query level, so instructions never appear
+  as facts and never become source material for extraction.
+- `deleteMemory()` needed no changes and works on them unmodified, with the
+  same scope enforcement.
+
+Points written before `type` existed carry no such field. The exclusion filter
+uses `must_not` on the procedural value rather than requiring `type: "fact"`,
+so legacy points stay visible — a missing field cannot match.
+
 ## Known limitations (deliberately deferred, not overlooked)
 
 - No temporal/observation-date grounding — every fact is implicitly "as
@@ -159,20 +199,18 @@ add sentences one per line, then `list` / `list all` to see the scope,
   as an update rather than a duplicate — confirmed not fixable via prompt
   engineering alone after three attempts; accepted because the
   link-don't-delete architecture makes the consequence mild
-- A single message updating two facts at once does not reliably link both.
-  A state-rewrite rule with four worked examples (location, job/role,
-  living situation, possession) helps, but the dominant factor turned out
-  not to be the examples at all: it is whether the new message *signals
-  that the old fact no longer holds*. Measured in isolation against the
-  same stored job fact, "I started at a logistics company" links 0/5 —
-  because starting a job does not assert that the previous one ended —
-  while "I switched to", "I left X and started at Y" and "I now work at"
-  each link 5/5. The same applies in reverse to location: "I relocated to
-  Hyderabad" links 5/5, but "I stayed in Hyderabad this week" links 0/5.
-  The model is arguably right to refuse the non-exclusive cases, so part of
-  the measured failure rate is a flawed test input rather than a defect.
-  Measured, not assumed — see `npm run test:extraction`. A stronger
-  extraction model closes much of the remainder at roughly 10x per-token
+- A single message updating two facts at once links reliably only when the
+  message signals that the old fact stopped holding — see the split rates
+  under Testing. Whether that should be made an explicit prompt rule (a
+  statement that mentioning a new employer/home/partner without indicating
+  the previous one ended is not a supersede) is a **tracked candidate, not
+  implemented**: it would make the behaviour deliberate rather than
+  emergent, at the risk of over-suppressing legitimate updates, and needs
+  measuring before adoption
+- Dimensions with no worked example in the prompt (`3c`) still link only
+  about half the time. Gains from examples are per-dimension rather than
+  cumulative, so an example-per-dimension arms race scales badly. A
+  stronger extraction model closes much of this at roughly 10x per-token
   cost; the default deliberately stays on gpt-4o-mini
 - Retrieval scores every memory independently against the query, so a fact
   reachable only *through* another fact is not retrievable. Confirmed with

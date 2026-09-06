@@ -14,9 +14,28 @@
 // the prompt rather than reasoning. Those examples now use bracketed
 // placeholders, and these rates are the corrected, like-for-like baseline.
 //
-// Also note that 3b's job clause ("also started at a logistics company") does
-// not actually assert that the previous job ended, so a portion of its failure
-// rate is the model declining a supersede it was never licensed to make.
+// Why 3b is split into -explicit and -ambiguous: the dominant factor in whether
+// an update links is not the dimension, nor how well the prompt demonstrates it,
+// but whether the message signals that the OLD fact stopped holding. Measured in
+// isolation against the same stored job fact: "I started at a logistics company"
+// links 0/5, while "I switched to", "I left X and started at Y" and "I now work
+// at" each link 5/5. The same holds in reverse for location — "I relocated to
+// Hyderabad" links 5/5, "I stayed in Hyderabad this week" links 0/5.
+//
+// The ambiguous phrasing genuinely does not assert that the previous job ended
+// (people hold two jobs), so refusing to supersede there is defensible, not a
+// defect — superseding would hide a fact the user never retracted. Blending both
+// regimes into one 3b number averaged a capability with a judgement call and
+// made the result uninterpretable. They are now tracked separately: -explicit is
+// a real capability measure and should stay high; -ambiguous records what the
+// model currently does with an under-specified update, and a HIGH rate there is
+// arguably the worse outcome.
+//
+// Tracked future candidate (not implemented): an explicit exclusivity rule in
+// the extraction prompt, stating that mentioning a new employer/home/partner
+// without indicating the previous one ended is not a supersede. It would make
+// the behaviour deliberate rather than emergent, at the risk of over-suppressing
+// legitimate updates. Needs measuring before adoption.
 //
 // Run: npm run test:extraction
 import { add, getAll, type Scope } from "../lib/memory";
@@ -52,11 +71,20 @@ interface Scenario {
 
 const SCENARIOS: Scenario[] = [
   {
-    name: "3b — dimensions demonstrated in the prompt (location + job)",
-    slug: "3b",
+    name: "3b-explicit — demonstrated dims, clear departure signal (expect HIGH)",
+    slug: "3b-explicit",
     factA: "My current city is Pune.",
     factB: "I work as a designer at an edtech company.",
-    update: "I relocated to Hyderabad and also started at a logistics company.",
+    update: "I relocated to Hyderabad and switched to a logistics company.",
+    staleA: /Pune/,
+    staleB: /edtech/,
+  },
+  {
+    name: "3b-ambiguous — demonstrated dims, NO departure signal (low is defensible)",
+    slug: "3b-ambiguous",
+    factA: "My current city is Pune.",
+    factB: "I work as a designer at an edtech company.",
+    update: "I stayed in Hyderabad this week and also started at a logistics company.",
     staleA: /Pune/,
     staleB: /edtech/,
   },
