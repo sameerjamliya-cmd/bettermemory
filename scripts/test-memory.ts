@@ -1,6 +1,6 @@
 import * as readline from "readline/promises";
 import { stdin, stdout } from "process";
-import { add, search, getAll, deleteMemory } from "../lib/memory";
+import { add, search, getAll, deleteMemory, addProcedural, getProcedural } from "../lib/memory";
 
 async function main() {
   const rl = readline.createInterface({ input: stdin, output: stdout });
@@ -12,11 +12,22 @@ async function main() {
   console.log(`\nScope: ${JSON.stringify(scope)}\n`);
   console.log("Enter sentences to add one at a time. Empty line to stop adding.");
   console.log('Commands: "list" (live memories), "list all" (including superseded),');
-  console.log('          "delete <id>" (remove one memory from this scope).\n');
+  console.log('          "delete <id>" (remove one memory from this scope),');
+  console.log('          "remember <instruction>" (store a procedural memory verbatim),');
+  console.log('          "instructions" (list procedural memories).\n');
 
   while (true) {
     const line = await rl.question("add> ");
     if (line.trim() === "") break;
+
+    const rememberMatch = line.trim().match(/^remember\s+(.+)$/i);
+    if (rememberMatch) {
+      const stored = await addProcedural(rememberMatch[1], scope);
+      console.log(`\nstored procedural memory ${stored.id}`);
+      console.log(`  "${stored.content}"`);
+      console.log("  (verbatim — no extraction, no dedup, hidden from search/list)\n");
+      continue;
+    }
 
     const deleteMatch = line.trim().match(/^delete\s+(\S+)$/i);
     if (deleteMatch) {
@@ -36,6 +47,20 @@ async function main() {
     }
 
     const command = line.trim().toLowerCase();
+    if (command === "instructions") {
+      const instructions = await getProcedural(scope);
+      console.log(
+        `\n${instructions.length} procedural memor${instructions.length === 1 ? "y" : "ies"} in ` +
+          `${JSON.stringify(scope)}, newest first:`
+      );
+      for (const m of instructions) {
+        console.log(`  ${m.createdAt}  ${m.id}`);
+        console.log(`    "${m.content}"`);
+      }
+      console.log("");
+      continue;
+    }
+
     if (command === "list" || command === "list all") {
       const includeSuperseded = command === "list all";
       const memories = await getAll(scope, { includeSuperseded });
