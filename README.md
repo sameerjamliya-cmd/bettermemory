@@ -279,6 +279,41 @@ Measured on `gpt-4o-mini`, one message updating two facts at once:
 - **Temporal grounding is approximate.** `observedAt` resolves relative references
   ("last week") against the observation date rather than now, but resolution
   succeeds roughly two times in three and produces week-granular dates.
+- **The extraction model occasionally links two unrelated facts as an update.**
+  A bench-press fact superseding a squat fact, for example, which hides the
+  squat fact from default retrieval. This is a standing defect of the
+  extraction step, measured at roughly 1-7% of calls on the scenario used to
+  probe it (`scripts/` is not wired to test it; the suite's BM25 case fails
+  intermittently when it fires). It is the one behaviour here that can hide a
+  user's data without being asked to, and it is not fixed.
+
+  It was **investigated thoroughly and found NOT to be caused by the temporal
+  grounding prompt block**, contrary to an initial n=50 reading. Full history,
+  same methodology throughout (50 trials of "My squat PR is 90kg." followed by
+  "My bench PR is 90kg.", counting how often the second superseded the first):
+
+  | Arm | Rate |
+  | --- | --- |
+  | n=50, no temporal block | 0/50 |
+  | n=50, temporal block (original wording) | 3/50 |
+  | n=50, same-length neutral filler block | 0/50 |
+  | n=50, temporal block (narrowed wording) | 2/50 |
+  | **n=150, temporal block (as shipped)** | **2/150 (1.3%)** |
+  | **n=150, temporal block removed** | **11/150 (7.3%)** |
+
+  At n=150 the difference is statistically significant (Fisher's exact,
+  two-tailed, p = 0.020) but points the **opposite way** from the n=50 study —
+  the arm *with* the temporal block had the lower defect rate. Pooling every
+  arm ever run (7/250 with the block, 11/250 without) gives p = 0.472. A
+  reversal of direction between two studies using identical methodology is
+  evidence of an uncontrolled, time-varying factor — the arms ran at different
+  times, and provider-side behaviour drifted noticeably over the session — not
+  of a prompt effect in either direction.
+
+  **Conclusion: the temporal block does not cause this defect.** The defect is
+  real, pre-existing, and independent of it. Fixing it (tightening the
+  supersede rule further, or moving the extraction decision off `gpt-4o-mini`)
+  is a deliberate future decision, not something to rush.
 
 **A correction worth recording**
 
