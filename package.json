@@ -8,7 +8,9 @@
     "start": "next start",
     "test:memory": "tsx --env-file=.env.local scripts/test-memory.ts",
     "test:suite": "tsx --env-file=.env.local scripts/test-suite.ts",
-    "test:extraction": "tsx --env-file=.env.local scripts/test-extraction.ts"
+    "test:extraction": "tsx --env-file=.env.local scripts/test-extraction.ts",
+    "test:e2e": "tsx --env-file=.env.local scripts/test-e2e.ts",
+    "test:providers": "tsx scripts/test-providers.ts"
   },
   "dependencies": {
     "@qdrant/js-client-rest": "^1.11.0",

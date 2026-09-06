@@ -189,40 +189,107 @@ Points written before `type` existed carry no such field. The exclusion filter
 uses `must_not` on the procedural value rather than requiring `type: "fact"`,
 so legacy points stay visible — a missing field cannot match.
 
+## API and dashboard
+
+Three thin Next.js routes wrap the library, plus a view-only page at
+`/dashboard` for inspecting a scope and running searches:
+
+| Route | Body / params |
+| --- | --- |
+| `POST /api/memory/add` | `{ text, scope, options? }` (or `imageBase64`) |
+| `POST /api/memory/search` | `{ query, scope }` |
+| `GET /api/memory/all` | `?userId=&agentId=&runId=&includeSuperseded=` |
+
+The routes duplicate no validation: scope and input checks come from
+`add()`/`search()`/`getAll()` themselves, and a thrown `Invalid ...` becomes a
+400.
+
+> **⚠️ There is no authentication of any kind on these routes.**
+> Anyone who can reach the port can read, write and enumerate every scope, and
+> `userId` is the only thing separating one user's memories from another's — it
+> is an identifier, not a credential. Guessing or supplying another `userId` is
+> enough to read that scope in full. Do not bind this to a public interface, put
+> it behind a reverse proxy, or deploy it anywhere reachable from a network you
+> do not control. It is a localhost debugging tool with the same trust model as
+> the console script, and making it safe to expose would mean real authentication,
+> per-user authorisation on every scope parameter, and rate limiting — none of
+> which exist.
+
 ## Known limitations (deliberately deferred, not overlooked)
 
-- No temporal/observation-date grounding — every fact is implicitly "as
-  of when `add()` was called." Fine for live use, would break on
-  backfilling historical data (the same gap found in mem0's own
-  open-source version)
-- The model occasionally misclassifies a pure reword (no new information)
-  as an update rather than a duplicate — confirmed not fixable via prompt
-  engineering alone after three attempts; accepted because the
-  link-don't-delete architecture makes the consequence mild
-- A single message updating two facts at once links reliably only when the
-  message signals that the old fact stopped holding — see the split rates
-  under Testing. Whether that should be made an explicit prompt rule (a
-  statement that mentioning a new employer/home/partner without indicating
-  the previous one ended is not a supersede) is a **tracked candidate, not
-  implemented**: it would make the behaviour deliberate rather than
-  emergent, at the risk of over-suppressing legitimate updates, and needs
-  measuring before adoption
-- Dimensions with no worked example in the prompt (`3c`) still link only
-  about half the time. Gains from examples are per-dimension rather than
-  cumulative, so an example-per-dimension arms race scales badly. A
-  stronger extraction model closes much of this at roughly 10x per-token
-  cost; the default deliberately stays on gpt-4o-mini
-- Retrieval scores every memory independently against the query, so a fact
-  reachable only *through* another fact is not retrievable. Confirmed with
-  an ablation: two linked facts sharing no vocabulary with each other score
-  bit-for-bit identically whether or not the other is present. An
-  associative-linking mechanism is designed but deliberately not built
-- No `history()`/audit trail per memory
-- `findRelated()` (the context passed to extraction) does not filter
-  superseded facts, so the model can see stale versions when deciding what
-  to supersede
-- `search()` does not validate its query string the way `add()` validates
-  its input text
+Consolidated here rather than scattered across commits. Numbers are measured,
+not estimated — reproduce them with `npm run test:extraction`.
+
+**Extraction quality (stochastic, model-dependent)**
+
+Measured on `gpt-4o-mini`, one message updating two facts at once:
+
+| Scenario | Rate |
+| --- | --- |
+| `3b-explicit` — clear departure signal ("relocated to", "switched to") | 6/6 |
+| `3b-ambiguous` — no departure signal ("stayed in", "also started at") | 0/6 |
+| `3c` — dimensions with no worked example (relationship + habit) | 3/6 to 6/6 across runs |
+
+- **`3b-ambiguous` scoring 0 is the defensible outcome, not a bug.** "I also
+  started at a logistics company" does not assert the previous job ended, so
+  superseding would hide a fact the user never retracted. A *high* rate on that
+  row would be worse.
+- **The job-role exclusivity rule is a tracked candidate, deliberately not
+  implemented.** Stating in the prompt that mentioning a new employer/home/partner
+  without indicating the previous one ended is not a supersede would make the
+  behaviour deliberate rather than emergent, at the risk of over-suppressing
+  legitimate updates. It needs measuring before adoption.
+- **`3c` varies run to run.** Gains from worked examples are per-dimension rather
+  than cumulative, so an example-per-dimension arms race scales badly. A stronger
+  extraction model closes much of the gap at roughly 10x per-token cost.
+- **Pure rewords** are sometimes classified as updates rather than duplicates.
+  Three prompt revisions failed to fix it; accepted because link-don't-delete
+  makes the consequence mild (id churn, no data loss).
+
+**Retrieval**
+
+- **No associative retrieval.** Every memory is scored independently against the
+  query, so a fact reachable only *through* another fact is unreachable. Confirmed
+  by ablation: two linked facts sharing no vocabulary score bit-for-bit
+  identically whether or not the other is present. A mechanism
+  (`associatedMemoryIds` + an opt-in `expandAssociations`) is designed and
+  deliberately not built — the diagnostics justified it, the cost/benefit was not
+  yet worth it.
+- **No memory strength or importance weighting.** Ranking is similarity only.
+  Measured: asked "anything significant lately", a new job ranked *below*
+  restocking a fridge and sorting a sock drawer, with the whole field spanning
+  ~0.02 of combined score. Nothing encodes that some memories matter more.
+- **No reconsolidation.** Memories are never revised, merged, or strengthened by
+  being retrieved or re-encountered — retrieval is read-only, and a fact restated
+  ten times is identical to one stated once.
+- **`findRelated()` does not filter superseded facts**, so the extraction model
+  can see stale versions when deciding what to supersede.
+- **`search()` does not validate its query string** the way `add()` validates its
+  input text.
+
+**Infrastructure**
+
+- **The API has no authentication** — see the warning above. Localhost only.
+- **The provider seam has exactly one real implementation of each interface.**
+  `VectorStoreClient` and `LLMClient` exist and are proven by an in-memory mock
+  (`add()` → `search()` round-trip with no network), but the only production
+  implementations are Qdrant and OpenAI. The abstraction is real; the portability
+  is unproven against a second vendor, and a second vendor would likely surface
+  assumptions the mock does not.
+- **Temporal grounding is approximate.** `observedAt` resolves relative references
+  ("last week") against the observation date rather than now, but resolution
+  succeeds roughly two times in three and produces week-granular dates.
+
+**A correction worth recording**
+
+Feature #3 (usage notices) was originally understood as simple UX tips, by
+analogy with a `notices.py` in mem0. That reading was wrong: mem0's is a
+**commercial feature-gating system** — it decides what to advertise and gate
+based on account state. What is implemented here is a deliberately simpler,
+honest reimplementation of the *idea* of a proactive notice (first-run and
+scale-threshold messages computed locally, returned in `AddResult.notice`, with
+no telemetry and nothing leaving the system). It is not a port of theirs, and
+should not be described as parity with it.
 
 ## Setup
 
@@ -248,6 +315,8 @@ npm run test:suite
 | Command | What it does |
 | --- | --- |
 | `npm run test:suite` | 11-case regression suite, self-cleaning |
+| `npm run test:e2e` | One session exercising every feature in sequence (26 checks) |
+| `npm run test:providers` | Provider seam against in-memory mocks — no network, no API key |
 | `npm run test:extraction` | Extraction-quality rates (non-gating, always exits 0) |
 | `npm run test:memory` | Interactive console (add / list / delete / search) |
 | `npm run dev` | Next.js dev server |

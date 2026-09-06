@@ -1,13 +1,27 @@
 import { randomUUID, createHash } from "crypto";
-import {
-  openai,
-  qdrant,
-  COLLECTION_NAME,
-  EMBEDDING_MODEL,
-  EMBEDDING_DIMENSIONS,
-  EXTRACTION_MODEL,
-} from "./clients";
+import { QdrantVectorStore } from "./providers/qdrant-store";
+import { OpenAILLMClient } from "./providers/openai-llm";
+import type {
+  ExtractedFact,
+  FieldCondition,
+  LLMClient,
+  MemoryFilter,
+  VectorStoreClient,
+} from "./providers/types";
 import { logEvent } from "./logger";
+
+// The concrete providers are chosen once, here. Everything below this line talks
+// only to the two interfaces. Swapping vendors means constructing a different
+// implementation — not editing any orchestration function.
+let store: VectorStoreClient = new QdrantVectorStore();
+let llm: LLMClient = new OpenAILLMClient();
+
+/** Replace the providers. Intended for tests that need an in-memory store; there
+ *  is deliberately no config file or env switch behind this. */
+export function setProviders(providers: { vectorStore?: VectorStoreClient; llm?: LLMClient }): void {
+  if (providers.vectorStore) store = providers.vectorStore;
+  if (providers.llm) llm = providers.llm;
+}
 
 const BM25_MIDPOINT = 5;
 const BM25_STEEPNESS = 0.5;
@@ -15,6 +29,9 @@ const BM25_K1 = 1.5;
 const BM25_B = 0.75;
 const HYBRID_CANDIDATE_POOL = 20;
 const SCROLL_PAGE_SIZE = 100;
+// Counts at which add() surfaces a one-off scale notice. Crossing a value fires
+// once; ordinary calls either side of it stay silent.
+const SCALE_NOTICE_THRESHOLDS = [100, 500, 1000];
 
 export interface Scope {
   userId: string;
@@ -55,36 +72,40 @@ export type MemoryType = "fact" | "procedural";
 // Points written before `type` existed have no such field. Filtering with
 // must_not on the procedural value (rather than must type == "fact") keeps
 // those legacy points visible, since a missing field cannot match.
-const EXCLUDE_PROCEDURAL = { key: "type", match: { value: "procedural" as const } };
+const EXCLUDE_PROCEDURAL: FieldCondition = { key: "type", equals: "procedural" };
 
-function scopeFilter(scope: ValidatedScope) {
-  const must: { key: string; match: { value: string } }[] = [
-    { key: "userId", match: { value: scope.userId } },
-  ];
-  if (scope.agentId !== null) must.push({ key: "agentId", match: { value: scope.agentId } });
-  if (scope.runId !== null) must.push({ key: "runId", match: { value: scope.runId } });
+function scopeFilter(scope: ValidatedScope): MemoryFilter {
+  const must: FieldCondition[] = [{ key: "userId", equals: scope.userId }];
+  if (scope.agentId !== null) must.push({ key: "agentId", equals: scope.agentId });
+  if (scope.runId !== null) must.push({ key: "runId", equals: scope.runId });
   return { must };
 }
 
-let collectionReady = false;
+// Hierarchical, matching read semantics: userId must match exactly, but an
+// unspecified agentId/runId in the caller's scope is a wildcard, exactly as
+// scopeFilter() treats it for search()/getAll(). A caller can therefore act on
+// anything it can see — and nothing it cannot. Cross-userId remains strict.
+function pointMatchesScope(
+  payload: Record<string, unknown> | null | undefined,
+  scope: ValidatedScope
+): boolean {
+  const p = payload ?? {};
+  const userId = typeof p.userId === "string" ? p.userId : null;
+  const agentId = typeof p.agentId === "string" ? p.agentId : null;
+  const runId = typeof p.runId === "string" ? p.runId : null;
+  return (
+    userId === scope.userId &&
+    (scope.agentId === null || agentId === scope.agentId) &&
+    (scope.runId === null || runId === scope.runId)
+  );
+}
 
 async function ensureCollection() {
-  if (collectionReady) return;
-  const { exists } = await qdrant.collectionExists(COLLECTION_NAME);
-  if (!exists) {
-    await qdrant.createCollection(COLLECTION_NAME, {
-      vectors: { size: EMBEDDING_DIMENSIONS, distance: "Cosine" },
-    });
-  }
-  collectionReady = true;
+  await store.ensureReady();
 }
 
 async function embed(text: string): Promise<number[]> {
-  const res = await openai.embeddings.create({
-    model: EMBEDDING_MODEL,
-    input: text,
-  });
-  return res.data[0].embedding;
+  return llm.embed(text);
 }
 
 interface RelatedMemoryInternal extends RelatedMemory {
@@ -93,14 +114,13 @@ interface RelatedMemoryInternal extends RelatedMemory {
 
 async function findRelated(text: string, scope: ValidatedScope): Promise<RelatedMemoryInternal[]> {
   const vector = await embed(text);
-  const res = await qdrant.query(COLLECTION_NAME, {
-    query: vector,
-    // Procedural memories are instructions, not source material for extraction.
-    filter: { ...scopeFilter(scope), must_not: [EXCLUDE_PROCEDURAL] },
-    limit: 5,
-    with_payload: true,
-  });
-  return res.points.map((point) => ({
+  // Procedural memories are instructions, not source material for extraction.
+  const points = await store.query(
+    { ...scopeFilter(scope), mustNot: [EXCLUDE_PROCEDURAL] },
+    vector,
+    5
+  );
+  return points.map((point) => ({
     id: String(point.id),
     content: String(point.payload?.content ?? ""),
     source: String(point.payload?.source ?? ""),
@@ -169,23 +189,17 @@ async function findSupersededIds(
   if (ids.length === 0) return new Set();
   const base = scopeFilter(scope);
   const superseded = new Set<string>();
-  let offset: string | number | undefined | null = undefined;
-  do {
-    const page = await qdrant.scroll(COLLECTION_NAME, {
-      filter: {
-        must: [...base.must, { key: "supersededMemoryId", match: { any: ids } }],
-      },
-      limit: SCROLL_PAGE_SIZE,
-      offset: offset ?? undefined,
-      with_payload: ["supersededMemoryId"],
-      with_vector: false,
-    });
-    for (const point of page.points) {
+  const filter: MemoryFilter = {
+    must: [...(base.must ?? []), { key: "supersededMemoryId", anyOf: ids }],
+  };
+  for await (const page of store.scroll(filter, SCROLL_PAGE_SIZE, {
+    payloadFields: ["supersededMemoryId"],
+  })) {
+    for (const point of page) {
       const target = point.payload?.supersededMemoryId;
       if (typeof target === "string") superseded.add(target);
     }
-    offset = page.next_page_offset as typeof offset;
-  } while (offset !== null && offset !== undefined);
+  }
   return superseded;
 }
 
@@ -201,7 +215,9 @@ function labelMemories(memories: RelatedMemoryInternal[]): LabeledMemory[] {
 function buildExtractionPrompt(
   text: string,
   labeled: LabeledMemory[],
-  customInstructions?: string
+  customInstructions?: string,
+  observedAt?: string,
+  currentDate?: string
 ): string {
   // Placed after every rule and example, so a per-call instruction supplements
   // the core contract rather than replacing it, and immediately before the
@@ -217,6 +233,11 @@ Additional instructions may refine what counts as significant or how facts are p
 `
     : "";
 
+  // Both dates are always supplied by add(); they are optional here only so the
+  // prompt builder stays usable in isolation.
+  const observation = observedAt ?? new Date().toISOString();
+  const now = currentDate ?? new Date().toISOString();
+
   const existingMemoriesBlock = labeled.length
     ? JSON.stringify(
         labeled.map(({ label, memory }) => ({ id: label, text: memory.content }))
@@ -227,6 +248,9 @@ Additional instructions may refine what counts as significant or how facts are p
 
 Existing Memories:
 ${existingMemoriesBlock}
+
+Observation Date (when the New Message was observed): ${observation}
+Current Date (now): ${now}
 
 New Message:
 ${text}
@@ -294,6 +318,17 @@ New Message: "I go to the gym 5 days a week."
 WRONG Output: [{"content": "I go to the gym 5 days a week.", "supersedes": null, "skip": false, "skipReason": null}, {"content": "My favorite language is TypeScript.", "supersedes": null, "skip": false, "skipReason": null}]  ← TypeScript fact was NOT in this New Message, it leaked in from Existing Memories
 CORRECT Output: [{"content": "I go to the gym 5 days a week.", "supersedes": null, "skip": false, "skipReason": null}]
 
+CRITICAL — Resolve every relative time reference in the New Message ("last week", "yesterday", "this morning", "a couple of months ago") against the Observation Date, never against the Current Date. The two are usually the same, but when they differ the Observation Date is the moment the message describes and is authoritative. State the resolved date in the fact where it matters, so the fact stays true when read later.
+
+Resolving a relative reference into a concrete date this way is expected and is NOT an invented value — the Observation Date is given to you above for exactly this purpose. It is the ONLY value that may enter a fact from outside the New Message, and it may ONLY be used to fill in a time reference. It must not influence any other decision: it never affects whether two facts describe the same underlying thing, and it never justifies a "supersedes" link.
+
+Example:
+Observation Date: 2026-03-14T09:00:00.000Z
+Current Date: 2026-09-06T12:00:00.000Z
+New Message: "Hit a new deadlift PR last week."
+WRONG: [{"content": "Hit a new deadlift PR in the week of 2026-08-31.", "supersedes": null}]  ← resolved against the Current Date
+CORRECT: [{"content": "Hit a new deadlift PR in the week of 2026-03-09.", "supersedes": null}]  ← resolved against the Observation Date
+
 CRITICAL — Do not resolve pronouns, ambiguous references, or implied subjects using content from Existing Memories. If the New Message contains a pronoun ("his", "her", "their", "it") or an ambiguous reference whose subject is not explicitly stated in the New Message itself, extract the fact with the reference intact, exactly as written — do not substitute in a name or detail pulled from Existing Memories, even if it seems like an obvious, helpful resolution.
 
 Example:
@@ -332,19 +367,6 @@ ${additionalInstructions}
 Return a JSON list of objects.`;
 }
 
-interface ExtractedFact {
-  content: string;
-  supersedes: string | null;
-  skip: boolean;
-  skipReason: string | null;
-}
-
-function blankToNull(value: string | null | undefined): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  return trimmed === "" ? null : trimmed;
-}
-
 function normalizeForHash(text: string): string {
   return text.toLowerCase().trim().replace(/\s+/g, " ");
 }
@@ -356,62 +378,13 @@ function hashContent(text: string): string {
 async function extractFacts(
   text: string,
   labeled: LabeledMemory[],
-  customInstructions?: string
+  customInstructions?: string,
+  observedAt?: string,
+  currentDate?: string,
+  imageDataUrl?: string
 ): Promise<ExtractedFact[]> {
-  const res = await openai.chat.completions.create({
-    model: EXTRACTION_MODEL,
-    messages: [
-      {
-        role: "user",
-        content: buildExtractionPrompt(text, labeled, customInstructions),
-      },
-    ],
-    tools: [
-      {
-        type: "function",
-        function: {
-          name: "return_facts",
-          description: "Return the extracted facts.",
-          parameters: {
-            type: "object",
-            properties: {
-              facts: {
-                type: "array",
-                items: {
-                  type: "object",
-                  properties: {
-                    content: { type: "string" },
-                    supersedes: { type: ["string", "null"] },
-                    skip: { type: "boolean" },
-                    skipReason: { type: ["string", "null"] },
-                  },
-                  required: ["content", "supersedes", "skip", "skipReason"],
-                },
-              },
-            },
-            required: ["facts"],
-          },
-        },
-      },
-    ],
-    tool_choice: { type: "function", function: { name: "return_facts" } },
-  });
-
-  const call = res.choices[0].message.tool_calls?.[0];
-  if (!call) return [];
-  const args = JSON.parse(call.function.arguments);
-  if (!Array.isArray(args.facts)) return [];
-
-  // The schema allows "string | null", and the model sometimes says "" where it
-  // means null. An empty label would otherwise reach labelToMemory.get(""),
-  // miss, and silently degrade a supersede into an unlinked new fact — the same
-  // input producing different stored shapes with no error. Normalise once, here,
-  // so downstream code only ever sees a real label or null.
-  return (args.facts as ExtractedFact[]).map((fact) => ({
-    ...fact,
-    supersedes: blankToNull(fact.supersedes),
-    skipReason: blankToNull(fact.skipReason),
-  }));
+  const prompt = buildExtractionPrompt(text, labeled, customInstructions, observedAt, currentDate);
+  return llm.extractFacts(prompt, imageDataUrl ? { imageDataUrl } : undefined);
 }
 
 export interface RelatedMemory {
@@ -449,6 +422,9 @@ export interface StoredFact {
   content: string;
   source: string;
   extractedAt: string;
+  // When the message was observed. Defaults to write time, so it equals
+  // extractedAt for live use and differs only when a caller backfills.
+  observedAt: string;
   // The id of the memory this fact supersedes. The superseded point is left in
   // the collection; search() hides it by default instead of deleting it.
   supersededMemoryId: string | null;
@@ -464,29 +440,127 @@ export interface AddResult {
   relatedMemories: (RelatedMemory & { label: string })[];
   stored: StoredFact[];
   skipped: SkippedFact[];
+  // Informational only, and null on the overwhelming majority of calls. Computed
+  // locally from the scope's own count — nothing is recorded or sent anywhere.
+  notice: string | null;
+}
+
+// One notice per call at most, first-run taking precedence over scale, mirroring
+// an if/elif chain rather than accumulating messages.
+function buildNotice(countBefore: number, countAfter: number): string | null {
+  if (countBefore === 0 && countAfter > 0) {
+    return (
+      "This is your first memory for this scope. Facts you add will be extracted, " +
+      "deduplicated, and retrievable via search()."
+    );
+  }
+
+  const crossed = SCALE_NOTICE_THRESHOLDS.filter((t) => countBefore < t && countAfter >= t);
+  if (crossed.length > 0) {
+    const threshold = Math.max(...crossed);
+    return (
+      `This scope now has ${threshold}+ memories. Consider using getAll() periodically ` +
+      "to review what is active, or deleteAll() to reset if this is test data."
+    );
+  }
+
+  return null;
+}
+
+export interface AddInput {
+  text?: string;
+  // Raw base64, or a full data: URL. Never stored — only sent to the extraction
+  // call — because a base64 image in a Qdrant payload would dwarf the fact.
+  imageBase64?: string;
+}
+
+// PNG and JPEG cover what this path is for; the prefix check avoids asking the
+// caller for a mime type they may not have. An unrecognised payload is passed as
+// PNG rather than rejected, since the API will reject a genuinely bad image with
+// a clearer error than we could produce here.
+function toImageDataUrl(imageBase64: string): string {
+  const trimmed = imageBase64.trim();
+  if (trimmed.startsWith("data:")) return trimmed;
+  const mime = trimmed.startsWith("/9j/")
+    ? "image/jpeg"
+    : trimmed.startsWith("R0lGOD")
+      ? "image/gif"
+      : trimmed.startsWith("UklGR")
+        ? "image/webp"
+        : "image/png";
+  return `data:${mime};base64,${trimmed}`;
 }
 
 export async function add(
-  text: string,
+  input: string | AddInput,
   scope: Scope,
-  options?: { extract?: boolean; customInstructions?: string }
+  options?: { extract?: boolean; customInstructions?: string; observedAt?: string }
 ): Promise<AddResult> {
+  // Accepts a bare string (every existing caller) or an object that may carry an
+  // image. Normalised here so the rest of add() is unchanged either way.
+  const normalized: AddInput = typeof input === "string" ? { text: input } : input ?? {};
+  const trimmedText = (normalized.text ?? "").trim();
+  const imageBase64 = (normalized.imageBase64 ?? "").trim();
+
   // Reject empty input before spending an embedding and an LLM call on it.
-  const trimmedText = text.trim();
-  if (trimmedText === "") throw new Error('Invalid input: "text" must not be empty.');
+  if (trimmedText === "" && imageBase64 === "") {
+    throw new Error('Invalid input: provide "text", "imageBase64", or both.');
+  }
+  const imageDataUrl = imageBase64 === "" ? undefined : toImageDataUrl(imageBase64);
+
+  // Relative time references ("last week") resolve against observedAt, which
+  // defaults to now — so live callers see no change, and a backfill can say when
+  // the message was actually observed.
+  const currentDate = new Date().toISOString();
+  let observedAt = currentDate;
+  if (options?.observedAt !== undefined) {
+    const parsed = new Date(options.observedAt);
+    if (Number.isNaN(parsed.getTime())) {
+      throw new Error('Invalid input: "observedAt" must be a parseable ISO date string.');
+    }
+    observedAt = parsed.toISOString();
+  }
 
   const validatedScope = validateScope(scope);
   await ensureCollection();
   const extract = options?.extract ?? true;
 
-  const related = extract ? await findRelated(trimmedText, validatedScope) : [];
+  // findRelated needs a query embedding, and an image-only add has no text to
+  // embed. Such adds therefore run without related-memory context, which means no
+  // dedup and no supersede linking for them — see the README note.
+  // Counted once, before any write. countAfter is derived from stored.length
+  // rather than issuing a second count. Superseded points are included and
+  // procedural ones excluded, matching what this scope's facts cost to store.
+  const countBefore = await store.count({
+    ...scopeFilter(validatedScope),
+    mustNot: [EXCLUDE_PROCEDURAL],
+  });
+
+  const related =
+    extract && trimmedText !== "" ? await findRelated(trimmedText, validatedScope) : [];
   const labeled = labelMemories(related);
   const labelToMemory = new Map(labeled.map(({ label, memory }) => [label, memory]));
 
   const extracted = extract
-    ? await extractFacts(trimmedText, labeled, options?.customInstructions)
+    ? await extractFacts(
+        trimmedText === "" ? "(no accompanying text — extract from the attached image)" : trimmedText,
+        labeled,
+        options?.customInstructions,
+        observedAt,
+        currentDate,
+        imageDataUrl
+      )
     : [{ content: trimmedText, supersedes: null, skip: false, skipReason: null }];
   const extractedAt = new Date().toISOString();
+
+  // The base64 is deliberately not stored; the marker records that a fact came
+  // from an image so provenance is not silently lost.
+  const sourceText =
+    imageDataUrl === undefined
+      ? trimmedText
+      : trimmedText === ""
+        ? "[image]"
+        : `[image] ${trimmedText}`;
 
   const stored: StoredFact[] = [];
   const skipped: SkippedFact[] = [];
@@ -534,25 +608,24 @@ export async function add(
 
     const vector = await embed(fact.content);
     const id = randomUUID();
-    await qdrant.upsert(COLLECTION_NAME, {
-      points: [
-        {
-          id,
-          vector,
-          payload: {
-            content: fact.content,
-            source: trimmedText,
-            extractedAt,
-            type: "fact",
-            supersededMemoryId,
-            userId: validatedScope.userId,
-            agentId: validatedScope.agentId,
-            runId: validatedScope.runId,
-          },
+    await store.upsert([
+      {
+        id,
+        vector,
+        payload: {
+          content: fact.content,
+          source: sourceText,
+          extractedAt,
+          observedAt,
+          type: "fact",
+          supersededMemoryId,
+          userId: validatedScope.userId,
+          agentId: validatedScope.agentId,
+          runId: validatedScope.runId,
         },
-      ],
-    });
-    stored.push({ id, content: fact.content, source: trimmedText, extractedAt, supersededMemoryId });
+      },
+    ]);
+    stored.push({ id, content: fact.content, source: sourceText, extractedAt, observedAt, supersededMemoryId });
     dedupMap.set(hash, { id, content: fact.content });
   }
 
@@ -560,8 +633,14 @@ export async function add(
     relatedMemories: labeled.map(({ label, memory }) => ({ ...memory, label })),
     stored,
     skipped,
+    notice: buildNotice(countBefore, countBefore + stored.length),
   };
-  await logEvent({ call: "add", input: { text, scope, options }, output: result });
+  await logEvent({
+    call: "add",
+    // The image itself is omitted from the log — it would be megabytes of base64.
+    input: { text: trimmedText, hasImage: imageDataUrl !== undefined, scope, options },
+    output: result,
+  });
 
   return result;
 }
@@ -576,14 +655,13 @@ export async function search(
   const includeSuperseded = options?.includeSuperseded ?? false;
 
   const vector = await embed(query);
-  const res = await qdrant.query(COLLECTION_NAME, {
-    query: vector,
-    filter: { ...scopeFilter(validatedScope), must_not: [EXCLUDE_PROCEDURAL] },
-    limit: HYBRID_CANDIDATE_POOL,
-    with_payload: true,
-  });
+  const points = await store.query(
+    { ...scopeFilter(validatedScope), mustNot: [EXCLUDE_PROCEDURAL] },
+    vector,
+    HYBRID_CANDIDATE_POOL
+  );
 
-  const retrieved = res.points.map((point) => ({
+  const retrieved = points.map((point) => ({
     id: String(point.id),
     content: String(point.payload?.content ?? ""),
     source: String(point.payload?.source ?? ""),
@@ -657,16 +735,11 @@ export async function getAll(
   const includeSuperseded = options?.includeSuperseded ?? false;
 
   const retrieved: MemoryRecord[] = [];
-  let offset: string | number | undefined | null = undefined;
-  do {
-    const page = await qdrant.scroll(COLLECTION_NAME, {
-      filter: { ...scopeFilter(validatedScope), must_not: [EXCLUDE_PROCEDURAL] },
-      limit: SCROLL_PAGE_SIZE,
-      offset: offset ?? undefined,
-      with_payload: true,
-      with_vector: false,
-    });
-    for (const point of page.points) {
+  for await (const page of store.scroll(
+    { ...scopeFilter(validatedScope), mustNot: [EXCLUDE_PROCEDURAL] },
+    SCROLL_PAGE_SIZE
+  )) {
+    for (const point of page) {
       retrieved.push({
         id: String(point.id),
         content: String(point.payload?.content ?? ""),
@@ -679,8 +752,7 @@ export async function getAll(
         superseded: false,
       });
     }
-    offset = page.next_page_offset as typeof offset;
-  } while (offset !== null && offset !== undefined);
+  }
 
   // Same supersession check search() uses, not a second implementation of it.
   const supersededIds = await findSupersededIds(
@@ -724,25 +796,22 @@ export async function addProcedural(
   const createdAt = new Date().toISOString();
   const vector = await embed(trimmed);
   const id = randomUUID();
-  await qdrant.upsert(COLLECTION_NAME, {
-    wait: true,
-    points: [
-      {
-        id,
-        vector,
-        payload: {
-          content: trimmed,
-          source: trimmed,
-          extractedAt: createdAt,
-          type: "procedural",
-          supersededMemoryId: null,
-          userId: validatedScope.userId,
-          agentId: validatedScope.agentId,
-          runId: validatedScope.runId,
-        },
+  await store.upsert([
+    {
+      id,
+      vector,
+      payload: {
+        content: trimmed,
+        source: trimmed,
+        extractedAt: createdAt,
+        type: "procedural",
+        supersededMemoryId: null,
+        userId: validatedScope.userId,
+        agentId: validatedScope.agentId,
+        runId: validatedScope.runId,
       },
-    ],
-  });
+    },
+  ]);
 
   const result: ProceduralMemory = { id, content: trimmed, createdAt, type: "procedural" };
   await logEvent({ call: "addProcedural", input: { instruction, scope }, output: result });
@@ -757,16 +826,11 @@ export async function getProcedural(scope: Scope): Promise<ProceduralMemory[]> {
   await ensureCollection();
 
   const results: ProceduralMemory[] = [];
-  let offset: string | number | undefined | null = undefined;
-  do {
-    const page = await qdrant.scroll(COLLECTION_NAME, {
-      filter: { must: [...scopeFilter(validatedScope).must, EXCLUDE_PROCEDURAL] },
-      limit: SCROLL_PAGE_SIZE,
-      offset: offset ?? undefined,
-      with_payload: true,
-      with_vector: false,
-    });
-    for (const point of page.points) {
+  const filter: MemoryFilter = {
+    must: [...(scopeFilter(validatedScope).must ?? []), EXCLUDE_PROCEDURAL],
+  };
+  for await (const page of store.scroll(filter, SCROLL_PAGE_SIZE)) {
+    for (const point of page) {
       results.push({
         id: String(point.id),
         content: String(point.payload?.content ?? ""),
@@ -774,13 +838,190 @@ export async function getProcedural(scope: Scope): Promise<ProceduralMemory[]> {
         type: "procedural",
       });
     }
-    offset = page.next_page_offset as typeof offset;
-  } while (offset !== null && offset !== undefined);
+  }
 
   results.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
   await logEvent({ call: "getProcedural", input: { scope }, output: results });
   return results;
+}
+
+export interface StoredMemory {
+  id: string;
+  content: string;
+  source: string;
+  extractedAt: string;
+  observedAt: string | null;
+  supersededMemoryId: string | null;
+  superseded: boolean;
+  type: MemoryType;
+}
+
+export type GetResult =
+  | { status: "found"; memory: StoredMemory }
+  | { status: "not_found"; id: string }
+  | { status: "scope_mismatch"; id: string };
+
+function toStoredMemory(id: string, payload: Record<string, unknown>): StoredMemory {
+  const rawType = payload.type;
+  return {
+    id,
+    content: String(payload.content ?? ""),
+    source: String(payload.source ?? ""),
+    extractedAt: String(payload.extractedAt ?? ""),
+    observedAt: typeof payload.observedAt === "string" ? payload.observedAt : null,
+    supersededMemoryId:
+      typeof payload.supersededMemoryId === "string" ? payload.supersededMemoryId : null,
+    superseded: false,
+    // Points written before `type` existed are facts.
+    type: rawType === "procedural" ? "procedural" : "fact",
+  };
+}
+
+// Fetch one memory by id. Scope-checked exactly as deleteMemory is, and returns
+// a status rather than throwing so a miss and a refusal are handled the same way.
+// The refusal deliberately carries no content: it must not become a way to read
+// another scope's data by guessing ids.
+export async function get(id: string, scope: Scope): Promise<GetResult> {
+  const validatedScope = validateScope(scope);
+  await ensureCollection();
+
+  const [point] = await store.retrieve([id]);
+  if (!point) return { status: "not_found", id };
+  if (!pointMatchesScope(point.payload, validatedScope)) return { status: "scope_mismatch", id };
+
+  const memory = toStoredMemory(String(point.id), point.payload ?? {});
+  const successors = await findSupersededIds([memory.id], validatedScope);
+  memory.superseded = successors.has(memory.id);
+
+  const result: GetResult = { status: "found", memory };
+  await logEvent({ call: "get", input: { id, scope }, output: result });
+  return result;
+}
+
+export interface HistoryResult {
+  status: "found" | "not_found" | "scope_mismatch";
+  id: string;
+  // Oldest first: what this memory replaced, and what that replaced, and so on.
+  ancestors?: StoredMemory[];
+  memory?: StoredMemory;
+  // Everything that superseded this memory, directly or transitively. More than
+  // one direct successor is possible (branching supersession).
+  descendants?: StoredMemory[];
+}
+
+async function loadInScope(
+  id: string,
+  scope: ValidatedScope
+): Promise<StoredMemory | null> {
+  const [point] = await store.retrieve([id]);
+  if (!point || !pointMatchesScope(point.payload, scope)) return null;
+  return toStoredMemory(String(point.id), point.payload ?? {});
+}
+
+async function directSuccessors(id: string, scope: ValidatedScope): Promise<StoredMemory[]> {
+  const out: StoredMemory[] = [];
+  const filter: MemoryFilter = {
+    must: [...(scopeFilter(scope).must ?? []), { key: "supersededMemoryId", equals: id }],
+  };
+  for await (const page of store.scroll(filter, SCROLL_PAGE_SIZE)) {
+    for (const p of page) out.push(toStoredMemory(p.id, p.payload));
+  }
+  return out;
+}
+
+// The lifecycle of one memory, reconstructed from the supersededMemoryId links
+// rather than a separate event log: walk backwards through what it replaced and
+// forwards through what replaced it. No new storage is needed because the links
+// are never deleted — that is the whole point of link-based supersession.
+export async function history(id: string, scope: Scope): Promise<HistoryResult> {
+  const validatedScope = validateScope(scope);
+  await ensureCollection();
+
+  const [point] = await store.retrieve([id]);
+  if (!point) return { status: "not_found", id };
+  if (!pointMatchesScope(point.payload, validatedScope)) return { status: "scope_mismatch", id };
+
+  const memory = toStoredMemory(String(point.id), point.payload ?? {});
+  const seen = new Set<string>([memory.id]);
+
+  // Backwards: what this replaced, and what that replaced.
+  const ancestors: StoredMemory[] = [];
+  let cursor: string | null = memory.supersededMemoryId;
+  while (cursor && !seen.has(cursor)) {
+    seen.add(cursor);
+    const ancestor: StoredMemory | null = await loadInScope(cursor, validatedScope);
+    if (!ancestor) break;
+    ancestor.superseded = true;
+    ancestors.unshift(ancestor);
+    cursor = ancestor.supersededMemoryId;
+  }
+
+  // Forwards: everything that superseded this, breadth-first so branching is
+  // captured rather than only the first path.
+  const descendants: StoredMemory[] = [];
+  let frontier = await directSuccessors(memory.id, validatedScope);
+  while (frontier.length > 0) {
+    const next: StoredMemory[] = [];
+    for (const node of frontier) {
+      if (seen.has(node.id)) continue;
+      seen.add(node.id);
+      descendants.push(node);
+      next.push(...(await directSuccessors(node.id, validatedScope)));
+    }
+    frontier = next;
+  }
+  for (const d of descendants) {
+    d.superseded = descendants.some((other) => other.supersededMemoryId === d.id);
+  }
+  memory.superseded = descendants.some((d) => d.supersededMemoryId === memory.id);
+
+  const result: HistoryResult = { status: "found", id, ancestors, memory, descendants };
+  await logEvent({ call: "history", input: { id, scope }, output: result });
+  return result;
+}
+
+export interface DeleteAllResult {
+  deleted: number;
+  includedProcedural: boolean;
+}
+
+// Deletes everything the scope covers, using the same hierarchical semantics as
+// deleteMemory: a broad {userId} scope removes narrower agent/run-scoped points
+// beneath it, and never reaches another userId.
+//
+// includeProcedural defaults to true, matching "delete every memory in this
+// scope". Pass false to keep standing instructions while clearing learned facts
+// — that is the only behaviour that would make reset() meaningfully different
+// from this function.
+export async function deleteAll(
+  scope: Scope,
+  options?: { includeProcedural?: boolean }
+): Promise<DeleteAllResult> {
+  const validatedScope = validateScope(scope);
+  await ensureCollection();
+  const includeProcedural = options?.includeProcedural ?? true;
+
+  const filter: MemoryFilter = includeProcedural
+    ? scopeFilter(validatedScope)
+    : { ...scopeFilter(validatedScope), mustNot: [EXCLUDE_PROCEDURAL] };
+
+  const count = await store.count(filter);
+  if (count > 0) await store.deleteByFilter(filter);
+
+  const result: DeleteAllResult = { deleted: count, includedProcedural: includeProcedural };
+  await logEvent({ call: "deleteAll", input: { scope, options }, output: result });
+  return result;
+}
+
+// Currently identical to deleteAll(scope) — see the note there. Kept as its own
+// entry point because "reset this scope to empty" is a different intent from
+// "delete these memories", and because it is the natural place to hang any
+// future teardown that deleteAll should not do.
+export async function reset(scope: Scope): Promise<DeleteAllResult> {
+  const result = await deleteAll(scope, { includeProcedural: true });
+  await logEvent({ call: "reset", input: { scope }, output: result });
+  return result;
 }
 
 export type DeleteResult =
@@ -802,11 +1043,7 @@ export async function deleteMemory(id: string, scope: Scope): Promise<DeleteResu
   const validatedScope = validateScope(scope);
   await ensureCollection();
 
-  const [point] = await qdrant.retrieve(COLLECTION_NAME, {
-    ids: [id],
-    with_payload: true,
-    with_vector: false,
-  });
+  const [point] = await store.retrieve([id]);
 
   if (!point) {
     const result: DeleteResult = { status: "not_found", id };
@@ -815,22 +1052,11 @@ export async function deleteMemory(id: string, scope: Scope): Promise<DeleteResu
   }
 
   // Scope enforcement: the caller may only delete what their own scope covers.
+  // (Shared with get() and history() via pointMatchesScope.)
   // Deliberately does not return the content of a point outside the caller's
   // scope — a refusal should not become a read primitive for another scope.
   const payload = point.payload ?? {};
-  const pointScope = {
-    userId: typeof payload.userId === "string" ? payload.userId : null,
-    agentId: typeof payload.agentId === "string" ? payload.agentId : null,
-    runId: typeof payload.runId === "string" ? payload.runId : null,
-  };
-  // Hierarchical, matching read semantics: userId must match exactly, but an
-  // unspecified agentId/runId in the caller's scope is a wildcard, exactly as
-  // scopeFilter() treats it for search()/getAll(). A caller can therefore delete
-  // anything it can see — and nothing it cannot. Cross-userId remains strict.
-  const matchesScope =
-    pointScope.userId === validatedScope.userId &&
-    (validatedScope.agentId === null || pointScope.agentId === validatedScope.agentId) &&
-    (validatedScope.runId === null || pointScope.runId === validatedScope.runId);
+  const matchesScope = pointMatchesScope(payload, validatedScope);
 
   if (!matchesScope) {
     const result: DeleteResult = { status: "scope_mismatch", id };
@@ -841,33 +1067,21 @@ export async function deleteMemory(id: string, scope: Scope): Promise<DeleteResu
   // Clear inbound supersede links before removing the point, so no window exists
   // in which a live memory references an id that is already gone.
   const referring: string[] = [];
-  let offset: string | number | undefined | null = undefined;
-  do {
-    const page = await qdrant.scroll(COLLECTION_NAME, {
-      filter: {
-        must: [
-          ...scopeFilter(validatedScope).must,
-          { key: "supersededMemoryId", match: { value: id } },
-        ],
-      },
-      limit: SCROLL_PAGE_SIZE,
-      offset: offset ?? undefined,
-      with_payload: false,
-      with_vector: false,
-    });
-    for (const p of page.points) referring.push(String(p.id));
-    offset = page.next_page_offset as typeof offset;
-  } while (offset !== null && offset !== undefined);
-
-  if (referring.length > 0) {
-    await qdrant.setPayload(COLLECTION_NAME, {
-      payload: { supersededMemoryId: null },
-      points: referring,
-      wait: true,
-    });
+  const referringFilter: MemoryFilter = {
+    must: [
+      ...(scopeFilter(validatedScope).must ?? []),
+      { key: "supersededMemoryId", equals: id },
+    ],
+  };
+  for await (const page of store.scroll(referringFilter, SCROLL_PAGE_SIZE, { payloadFields: [] })) {
+    for (const p of page) referring.push(p.id);
   }
 
-  await qdrant.delete(COLLECTION_NAME, { points: [id], wait: true });
+  if (referring.length > 0) {
+    await store.setPayload(referring, { supersededMemoryId: null });
+  }
+
+  await store.deleteByIds([id]);
 
   const result: DeleteResult = {
     status: "deleted",
