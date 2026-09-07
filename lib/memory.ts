@@ -29,8 +29,17 @@ import {
 import { buildExtractionPrompt, labelMemories, type LabeledMemory } from "./prompts/build";
 import { HYBRID_CANDIDATE_POOL, computeBM25Scores, fuseScores, tokenize } from "./scoring";
 import { hashContent } from "./dedup";
+import {
+  appendEvent,
+  eventsForMemories,
+  hasHistory,
+  predecessorOf,
+  successorsOf,
+  type MemoryEvent,
+} from "./events";
 import { logEvent } from "./logger";
 
+export type { MemoryEvent, MemoryEventType } from "./events";
 export type {
   AddInput, AddResult, DeleteAllResult, DeleteResult, GetResult, HistoryResult,
   MemoryRecord, MemoryType, ProceduralMemory, RelatedMemory, Scope, SearchResult,
@@ -284,6 +293,21 @@ export async function add(
         },
       },
     ]);
+    // Append-only history. A supersede is one event on the NEW memory carrying
+    // both sides of the change, so the old content survives the old point.
+    appendEvent(
+      target
+        ? {
+            memoryId: id,
+            event: "SUPERSEDE",
+            oldContent: target.content,
+            newContent: fact.content,
+            supersedesMemoryId: target.id,
+            scope: validatedScope,
+          }
+        : { memoryId: id, event: "ADD", oldContent: null, newContent: fact.content, scope: validatedScope }
+    );
+
     stored.push({ id, content: fact.content, source: sourceText, extractedAt, observedAt, supersededMemoryId });
     dedupMap.set(hash, { id, content: fact.content });
   }
@@ -452,6 +476,8 @@ export async function addProcedural(
     },
   ]);
 
+  appendEvent({ memoryId: id, event: "ADD", oldContent: null, newContent: trimmed, scope: validatedScope });
+
   const result: ProceduralMemory = { id, content: trimmed, createdAt, type: "procedural" };
   await logEvent({ call: "addProcedural", input: { instruction, scope }, output: result });
   return result;
@@ -522,73 +548,44 @@ export async function get(id: string, scope: Scope): Promise<GetResult> {
   return result;
 }
 
-async function loadInScope(
-  id: string,
-  scope: ValidatedScope
-): Promise<StoredMemory | null> {
-  const [point] = await store.retrieve([id]);
-  if (!point || !pointMatchesScope(point.payload, scope)) return null;
-  return toStoredMemory(String(point.id), point.payload ?? {});
-}
-
-async function directSuccessors(id: string, scope: ValidatedScope): Promise<StoredMemory[]> {
-  const out: StoredMemory[] = [];
-  const filter: MemoryFilter = {
-    must: [...(scopeFilter(scope).must ?? []), { key: "supersededMemoryId", equals: id }],
-  };
-  for await (const page of store.scroll(filter, SCROLL_PAGE_SIZE)) {
-    for (const p of page) out.push(toStoredMemory(p.id, p.payload));
-  }
-  return out;
-}
-
-// The lifecycle of one memory, reconstructed from the supersededMemoryId links
-// rather than a separate event log: walk backwards through what it replaced and
-// forwards through what replaced it. No new storage is needed because the links
-// are never deleted — that is the whole point of link-based supersession.
+// History is read from the append-only event log, never reconstructed from live
+// memory fields. That is the whole point: a memory can be deleted from the store
+// and its lineage still resolves, including the content it used to hold.
 export async function history(id: string, scope: Scope): Promise<HistoryResult> {
   const validatedScope = validateScope(scope);
-  await ensureCollection();
 
-  const [point] = await store.retrieve([id]);
-  if (!point) return { status: "not_found", id };
-  if (!pointMatchesScope(point.payload, validatedScope)) return { status: "scope_mismatch", id };
-
-  const memory = toStoredMemory(String(point.id), point.payload ?? {});
-  const seen = new Set<string>([memory.id]);
-
-  // Backwards: what this replaced, and what that replaced.
-  const ancestors: StoredMemory[] = [];
-  let cursor: string | null = memory.supersededMemoryId;
-  while (cursor && !seen.has(cursor)) {
-    seen.add(cursor);
-    const ancestor: StoredMemory | null = await loadInScope(cursor, validatedScope);
-    if (!ancestor) break;
-    ancestor.superseded = true;
-    ancestors.unshift(ancestor);
-    cursor = ancestor.supersededMemoryId;
+  if (!hasHistory(id, validatedScope)) {
+    // No events in this scope. An unknown id and one belonging to another scope
+    // are deliberately indistinguishable, so history() cannot be used to probe
+    // for ids outside the caller's scope.
+    const miss: HistoryResult = { status: "not_found", id };
+    await logEvent({ call: "history", input: { id, scope }, output: miss });
+    return miss;
   }
 
-  // Forwards: everything that superseded this, breadth-first so branching is
-  // captured rather than only the first path.
-  const descendants: StoredMemory[] = [];
-  let frontier = await directSuccessors(memory.id, validatedScope);
+  // Walk the chain both ways using the supersede links recorded in the log,
+  // then collect every event for every memory in it.
+  const chain = new Set<string>([id]);
+
+  let cursor: string | null = predecessorOf(id, validatedScope);
+  while (cursor && !chain.has(cursor)) {
+    chain.add(cursor);
+    cursor = predecessorOf(cursor, validatedScope);
+  }
+
+  let frontier = successorsOf(id, validatedScope);
   while (frontier.length > 0) {
-    const next: StoredMemory[] = [];
-    for (const node of frontier) {
-      if (seen.has(node.id)) continue;
-      seen.add(node.id);
-      descendants.push(node);
-      next.push(...(await directSuccessors(node.id, validatedScope)));
+    const next: string[] = [];
+    for (const memoryId of frontier) {
+      if (chain.has(memoryId)) continue;
+      chain.add(memoryId);
+      next.push(...successorsOf(memoryId, validatedScope));
     }
     frontier = next;
   }
-  for (const d of descendants) {
-    d.superseded = descendants.some((other) => other.supersededMemoryId === d.id);
-  }
-  memory.superseded = descendants.some((d) => d.supersededMemoryId === memory.id);
 
-  const result: HistoryResult = { status: "found", id, ancestors, memory, descendants };
+  const events = eventsForMemories([...chain], validatedScope);
+  const result: HistoryResult = { status: "found", id, events };
   await logEvent({ call: "history", input: { id, scope }, output: result });
   return result;
 }
@@ -613,9 +610,28 @@ export async function deleteAll(
     ? scopeFilter(validatedScope)
     : { ...scopeFilter(validatedScope), mustNot: [EXCLUDE_PROCEDURAL] };
 
-  const count = await store.count(filter);
-  if (count > 0) await store.deleteByFilter(filter);
+  // Read the points first so each removal can be logged individually. A bulk
+  // delete-by-filter alone would be one fewer round-trip but would erase what
+  // was removed, which is exactly what the event log exists to prevent.
+  const doomed: { id: string; content: string }[] = [];
+  for await (const page of store.scroll(filter, SCROLL_PAGE_SIZE)) {
+    for (const point of page) {
+      doomed.push({ id: point.id, content: String(point.payload?.content ?? "") });
+    }
+  }
 
+  if (doomed.length > 0) await store.deleteByFilter(filter);
+  for (const d of doomed) {
+    appendEvent({
+      memoryId: d.id,
+      event: "DELETE",
+      oldContent: d.content,
+      newContent: null,
+      scope: validatedScope,
+    });
+  }
+
+  const count = doomed.length;
   const result: DeleteAllResult = { deleted: count, includedProcedural: includeProcedural };
   await logEvent({ call: "deleteAll", input: { scope, options }, output: result });
   return result;
@@ -684,6 +700,15 @@ export async function deleteMemory(id: string, scope: Scope): Promise<DeleteResu
   }
 
   await store.deleteByIds([id]);
+
+  // The point is gone from the live store; its history is not.
+  appendEvent({
+    memoryId: id,
+    event: "DELETE",
+    oldContent: String(payload.content ?? ""),
+    newContent: null,
+    scope: validatedScope,
+  });
 
   const result: DeleteResult = {
     status: "deleted",

@@ -189,6 +189,41 @@ Points written before `type` existed carry no such field. The exclusion filter
 uses `must_not` on the procedural value rather than requiring `type: "fact"`,
 so legacy points stay visible — a missing field cannot match.
 
+## Event log and history()
+
+`history(id, scope)` reads from an **append-only event log**, not from the live
+memories. Every insert, supersede and delete appends a row:
+
+```
+MemoryEvent { id, memoryId, event: "ADD" | "SUPERSEDE" | "DELETE",
+              oldContent, newContent, supersedesMemoryId, createdAt, scope }
+```
+
+**Why this replaced the previous design.** History used to be reconstructed by
+walking `supersededMemoryId` across the live points. That works right up until
+someone deletes a memory the chain depends on — delete the root of an A -> B -> C
+chain and its content is simply gone, so the lineage can no longer be told. The
+log is never touched by deletes, so the same query still answers, and
+`history()` now resolves even for a memory that no longer exists.
+
+**Where it lives: SQLite, via Node's built-in `node:sqlite`**
+(`logs/memory-events.db`). The alternatives were worse fits: a second Qdrant
+collection would need a dummy vector per event and a network round-trip per
+write, for weaker queries than a local index; the existing JSONL logger is
+append-only but unindexed and has no notion of scope or event types.
+`node:sqlite` ships with Node 22+, so this adds a real indexed store with **no
+new dependency and no native build**, and it matches what mem0 uses for its own
+history table. It is still flagged experimental in Node, which is why it is
+isolated behind `lib/events.ts` — swapping in `better-sqlite3` would touch
+nothing else.
+
+`lib/events.ts` contains only `INSERT` and `SELECT`. There is deliberately no
+update or delete path, so removing a memory can never remove its history.
+
+One schema addition beyond mem0's shape: `supersedesMemoryId`. Content alone
+cannot identify a predecessor, so without it a chain could not be walked once
+its earlier links were deleted — the exact case this rebuild exists to serve.
+
 ## API and dashboard
 
 Three thin Next.js routes wrap the library, plus a view-only page at

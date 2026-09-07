@@ -41,8 +41,12 @@ async function main() {
     const all = await memory.getAll(s, { includeSuperseded: true });
     check("older versions preserved, flagged", all.length === 3 && all.filter((m) => m.superseded).length === 2);
     const h = await memory.history(c!.id, s);
-    check("history reconstructs full lineage", h.status === "found" && h.ancestors?.length === 2,
-      `ancestors=${h.ancestors?.length}`);
+    const chainIds = new Set((h.events ?? []).map((e) => e.memoryId));
+    check("history covers the whole lineage from the event log",
+      h.status === "found" && chainIds.size === 3,
+      `memories in lineage=${chainIds.size} events=${h.events?.length}`);
+    check("history retains the original 140kg content",
+      (h.events ?? []).some((e) => (e.newContent ?? "").includes("140kg")));
 
     // ---- 3. scoping + hierarchy ----------------------------------------
     console.log("\n3. scoping");

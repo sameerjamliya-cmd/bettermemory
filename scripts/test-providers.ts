@@ -124,7 +124,7 @@ async function main() {
   console.log(`  get(id) -> ${one.status}: "${one.status === "found" ? one.memory.content : ""}"`);
 
   const h = await history(a.stored[0].id, scope);
-  console.log(`  history(id) -> status=${h.status} ancestors=${h.ancestors?.length} descendants=${h.descendants?.length}`);
+  console.log(`  history(id) -> status=${h.status} events=${h.events?.length ?? 0}`);
 
   await addProcedural("Always reply in British English.", scope);
   console.log(`  getProcedural -> ${JSON.stringify((await getProcedural(scope)).map((m) => m.content))}`);

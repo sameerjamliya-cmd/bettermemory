@@ -28,3 +28,7 @@ logs/*.jsonl
 *.log
 .vscode/
 .idea/
+
+# SQLite event log (local runtime data)
+logs/*.db
+logs/*.db-journal

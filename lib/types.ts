@@ -91,14 +91,12 @@ export interface StoredMemory {
 }
 
 export interface HistoryResult {
-  status: "found" | "not_found" | "scope_mismatch";
+  status: "found" | "not_found";
   id: string;
-  // Oldest first: what this memory replaced, and what that replaced, and so on.
-  ancestors?: StoredMemory[];
-  memory?: StoredMemory;
-  // Everything that superseded this memory, directly or transitively. More than
-  // one direct successor is possible (branching supersession).
-  descendants?: StoredMemory[];
+  /** Every event for every memory in this lineage, oldest first. Present when
+   *  status is "found". Read from the append-only log, so entries survive the
+   *  deletion of the memories they describe. */
+  events?: import("./events").MemoryEvent[];
 }
 
 export interface DeleteAllResult {
