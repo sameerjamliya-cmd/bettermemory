@@ -4,7 +4,17 @@
 // deliberate placeholders — see the note at the top of the rules.
 
 /** Rules and examples, verbatim. Contains no interpolation. */
-export const EXTRACTION_RULES = String.raw`Extract any standalone facts from the new message as a list of objects: { "content": "...", "supersedes": "<id>" | null, "skip": true | false, "skipReason": "duplicate_of: <id>" | null }.
+export const EXTRACTION_RULES = String.raw`Extract any standalone facts from the new message as a list of objects: { "content": "...", "attributeKey": "...", "supersedes": "<id>" | null, "skip": true | false, "skipReason": "duplicate_of: <id>" | null }.
+
+"attributeKey" is a short, lowercase snake_case string naming what the fact is fundamentally ABOUT — the underlying attribute it records, not its wording. There is no fixed vocabulary; choose the key that fits. What matters is consistency: the same underlying attribute must get the same key however it is phrased, and two different attributes must never share a key.
+
+Choose the COARSEST key that still separates genuinely different attributes. Name the life dimension, not the facet mentioned in this particular sentence. An employer and a job title are the same attribute — both are "current_job", never "current_employer" in one fact and "current_job_title" in another — because a message mentioning only the new employer is still an update to the same underlying thing. The same applies to a city and a neighbourhood ("current_city"), or a partner's name and a relationship status ("relationship_status").
+
+Examples of keys: "squat_pr", "bench_pr", "deadlift_pr", "current_city", "current_job", "relationship_status", "living_situation", "favourite_snack", "car_owned", "gym_schedule".
+
+Note that "My squat PR is 90kg." and "My bench PR is 90kg." are DIFFERENT attributes ("squat_pr" and "bench_pr") even though they share a number and a sentence shape. "I moved to Bangalore." and "My current city is Chennai." are the SAME attribute ("current_city") even though they share no wording.
+
+The worked examples below concentrate on the "supersedes" decision and omit "attributeKey" for brevity. It is still required in every object you output.
 
 Note on the examples below: values in square brackets ([N], [CITY_NEW], [PERSON], ...) are placeholders standing in for real values. They illustrate the shape of correct output only. Never copy a bracketed placeholder, or any other literal value from an example, into a fact's "content" — the wording of every fact you extract must come from the New Message itself. This does not restrict "supersedes" or "skipReason", which reference the Existing Memories by their id and must still be set whenever the rules above call for it.
 

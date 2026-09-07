@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { loadMemoriesAction, searchAction } from "./actions";
 
 interface MemoryRow {
   id: string;
@@ -49,12 +50,10 @@ export default function Dashboard() {
     setError(null);
     setBusy(true);
     try {
-      const params = new URLSearchParams(scope());
-      if (includeSuperseded) params.set("includeSuperseded", "true");
-      const res = await fetch(`/api/memory/all?${params.toString()}`);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-      setMemories(data);
+      // Server action, not fetch: keeps API_KEY server-side.
+      const res = await loadMemoriesAction(scope() as never, includeSuperseded);
+      if (!res.ok) throw new Error(res.error);
+      setMemories(res.memories as MemoryRow[]);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setMemories(null);
@@ -68,14 +67,9 @@ export default function Dashboard() {
     setError(null);
     setBusy(true);
     try {
-      const res = await fetch("/api/memory/search", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, scope: scope() }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-      setResults(data);
+      const res = await searchAction(scope() as never, query);
+      if (!res.ok) throw new Error(res.error);
+      setResults(res.results as SearchRow[]);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setResults(null);
@@ -89,6 +83,7 @@ export default function Dashboard() {
       <h1 style={{ fontSize: 22 }}>Memory dashboard</h1>
       <p style={{ color: "#666", fontSize: 14 }}>
         View-only. Enter a scope to inspect its memories and run searches against it.
+        Runs through server actions, so the API key stays on the server.
       </p>
 
       <form onSubmit={loadMemories} style={box}>

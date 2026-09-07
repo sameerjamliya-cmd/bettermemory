@@ -59,6 +59,9 @@ export interface StoredFact {
   // The id of the memory this fact supersedes. The superseded point is left in
   // the collection; search() hides it by default instead of deleting it.
   supersededMemoryId: string | null;
+  /** What this fact is about, per extraction. Gates supersession: a candidate
+   *  link between two different attributeKeys is discarded. */
+  attributeKey: string | null;
   // True when the supersede link points at a CHRONOLOGICALLY NEWER memory — a
   // backfill that arrived late. The link is kept for lineage, but an
   // out-of-order fact never hides the fact it claims to replace.

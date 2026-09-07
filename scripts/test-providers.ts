@@ -95,7 +95,7 @@ class FakeLLMClient implements LLMClient {
     // Echo back the New Message as one fact, with no supersede/skip logic.
     const m = prompt.match(/New Message:\n(.*)\n/);
     const content = (m?.[1] ?? "unknown").trim();
-    return [{ content, supersedes: null, skip: false, skipReason: null }];
+    return [{ content, attributeKey: "mock_attribute", supersedes: null, skip: false, skipReason: null }];
   }
 }
 

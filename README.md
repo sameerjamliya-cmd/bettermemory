@@ -239,16 +239,53 @@ The routes duplicate no validation: scope and input checks come from
 `add()`/`search()`/`getAll()` themselves, and a thrown `Invalid ...` becomes a
 400.
 
-> **⚠️ There is no authentication of any kind on these routes.**
-> Anyone who can reach the port can read, write and enumerate every scope, and
-> `userId` is the only thing separating one user's memories from another's — it
-> is an identifier, not a credential. Guessing or supplying another `userId` is
-> enough to read that scope in full. Do not bind this to a public interface, put
-> it behind a reverse proxy, or deploy it anywhere reachable from a network you
-> do not control. It is a localhost debugging tool with the same trust model as
-> the console script, and making it safe to expose would mean real authentication,
-> per-user authorisation on every scope parameter, and rate limiting — none of
-> which exist.
+### Authentication
+
+Every route under `/api/memory/*` requires a bearer token:
+
+```
+Authorization: Bearer <API_KEY>
+```
+
+Set `API_KEY` in `.env.local`, generating a real secret rather than shipping the
+placeholder:
+
+```bash
+openssl rand -hex 32
+```
+
+```bash
+curl -H "Authorization: Bearer $API_KEY" \
+     "http://localhost:3000/api/memory/all?userId=sameer"
+
+curl -X POST http://localhost:3000/api/memory/add \
+     -H "Authorization: Bearer $API_KEY" \
+     -H 'Content-Type: application/json' \
+     -d '{"text":"My current city is Chennai.","scope":{"userId":"sameer"}}'
+```
+
+A missing key, a wrong key and a wrong scheme all return an identical **401** —
+distinguishing them would tell an attacker which part they got right. The check
+runs before any body parsing, scope validation or memory logic. Comparison is
+constant-time.
+
+The routes **fail closed**: if `API_KEY` is unset the API returns 500 rather
+than serving unauthenticated requests, so a missing config cannot quietly become
+an open deployment.
+
+The dashboard calls the library through **server actions**, not the HTTP API, so
+the key is never sent to the browser — verified: it appears in neither the
+rendered HTML nor any client JS chunk. The trade-off is that the dashboard does
+not exercise the bearer check; that path is covered by tests against the routes
+directly.
+
+> **⚠️ The API key controls who may call the API. It does not add per-user
+> isolation.**
+> `userId` remains an identifier, not a credential: any caller holding the key
+> can read and write *any* scope by naming it. Scoping separates data; it does
+> not authenticate the person asking. Multi-tenant use would need per-user
+> credentials and authorisation on every scope parameter, plus rate limiting —
+> none of which exist. Treat the key as a single trusted-operator secret.
 
 ## Known limitations (deliberately deferred, not overlooked)
 

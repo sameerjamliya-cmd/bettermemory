@@ -48,11 +48,12 @@ export class OpenAILLMClient implements LLMClient {
                     type: "object",
                     properties: {
                       content: { type: "string" },
+                      attributeKey: { type: "string" },
                       supersedes: { type: ["string", "null"] },
                       skip: { type: "boolean" },
                       skipReason: { type: ["string", "null"] },
                     },
-                    required: ["content", "supersedes", "skip", "skipReason"],
+                    required: ["content", "attributeKey", "supersedes", "skip", "skipReason"],
                   },
                 },
               },

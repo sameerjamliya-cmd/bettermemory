@@ -48,6 +48,10 @@ export interface VectorStoreClient {
 
 export interface ExtractedFact {
   content: string;
+  /** Short snake_case name for the underlying attribute this fact records.
+   *  Used as a deterministic gate on supersession: a candidate link between two
+   *  different attributes is discarded. */
+  attributeKey: string;
   supersedes: string | null;
   skip: boolean;
   skipReason: string | null;

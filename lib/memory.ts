@@ -75,6 +75,7 @@ async function embed(text: string): Promise<number[]> {
 interface RelatedMemoryInternal extends RelatedMemory {
   id: string;
   observedAt: string | null;
+  attributeKey: string | null;
 }
 
 // Where a memory sits in time: when it was observed if the caller said so,
@@ -100,6 +101,8 @@ async function findRelated(text: string, scope: ValidatedScope): Promise<Related
     extractedAt: String(point.payload?.extractedAt ?? ""),
     observedAt:
       typeof point.payload?.observedAt === "string" ? point.payload.observedAt : null,
+    attributeKey:
+      typeof point.payload?.attributeKey === "string" ? point.payload.attributeKey : null,
   }));
 }
 
@@ -234,7 +237,7 @@ export async function add(
         currentDate,
         imageDataUrl
       )
-    : [{ content: trimmedText, supersedes: null, skip: false, skipReason: null }];
+    : [{ content: trimmedText, attributeKey: "", supersedes: null, skip: false, skipReason: null }];
   const extractedAt = new Date().toISOString();
 
   // The base64 is deliberately not stored; the marker records that a fact came
@@ -272,7 +275,22 @@ export async function add(
     // supersedes is now either a real label or null (see blankToNull). A label
     // that still fails to resolve is a model error, not a formatting artefact:
     // store the fact unlinked rather than lose it.
-    const target = fact.supersedes !== null ? labelToMemory.get(fact.supersedes) : undefined;
+    const candidate = fact.supersedes !== null ? labelToMemory.get(fact.supersedes) : undefined;
+
+    // Deterministic confirmation of the model's candidate link. Extraction
+    // proposes; this decides. Two facts about DIFFERENT attributes are never an
+    // update of one another, however similar their wording — which is the
+    // "bench PR supersedes squat PR" failure.
+    //
+    // A candidate with no stored attributeKey predates this field, so its key is
+    // unknown rather than different: the link is allowed through and behaviour
+    // falls back to what it was before. The gate therefore only protects
+    // memories written from here on.
+    const newKey = fact.attributeKey?.trim() || null;
+    const candidateKey = candidate?.attributeKey ?? null;
+    const attributeMismatch =
+      candidate !== undefined && newKey !== null && candidateKey !== null && newKey !== candidateKey;
+    const target = attributeMismatch ? undefined : candidate;
 
     // Identical content is never a supersede — it carries no new information —
     // so the hash check runs even when the model asked to supersede that exact
@@ -313,6 +331,7 @@ export async function add(
           observedAt,
           type: "fact",
           supersededMemoryId,
+          attributeKey: newKey,
           outOfOrder,
           userId: validatedScope.userId,
           agentId: validatedScope.agentId,
@@ -337,7 +356,7 @@ export async function add(
 
     stored.push({
       id, content: fact.content, source: sourceText, extractedAt, observedAt,
-      supersededMemoryId, outOfOrder,
+      supersededMemoryId, attributeKey: newKey, outOfOrder,
     });
     dedupMap.set(hash, { id, content: fact.content });
   }

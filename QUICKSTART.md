@@ -11,7 +11,11 @@ docker compose up -d                 # Qdrant on :6333
 cp .env.example .env.local
 ```
 
-Open `.env.local` and set `OPENAI_API_KEY`. Nothing else needs changing.
+Open `.env.local` and set `OPENAI_API_KEY`, plus an `API_KEY` for the REST API:
+
+```bash
+openssl rand -hex 32     # paste the result as API_KEY
+```
 
 Check Qdrant is up:
 
@@ -68,7 +72,9 @@ npm run dev
 Open <http://localhost:3000/dashboard>, enter `sameer` as the userId, and click
 **Load memories**. Tick *include superseded* to see the history.
 
-> The API routes have **no authentication**. Keep this on localhost.
+> The dashboard reads the key server-side, so nothing secret reaches the browser.
+> Calling the API directly needs `Authorization: Bearer $API_KEY`. The key gates
+> who may call the API; it does not isolate one `userId` from another.
 
 ## Using it from code
 

@@ -1,13 +1,17 @@
-// ⚠️  NO AUTHENTICATION. These routes are a localhost debugging surface with the
-// same trust model as the console script: `userId` is an identifier, not a
-// credential, so anyone who can reach this port can read and write every scope
-// by supplying its userId. Do not bind to a public interface or deploy this.
+// Requires Authorization: Bearer <API_KEY>. The key gates who may call the API
+// at all; it does NOT add per-user isolation — a caller holding the key may
+// address any scope, so `userId` remains an identifier, not a credential.
 // See "API and dashboard" in the README.
 
 import { NextResponse } from "next/server";
+import { requireApiKey } from "../../../../lib/api-auth";
 import { getAll } from "../../../../lib/memory";
 
 export async function GET(request: Request) {
+  // Before any parsing, scope validation or memory logic.
+  const unauthorized = requireApiKey(request);
+  if (unauthorized) return unauthorized;
+
   const params = new URL(request.url).searchParams;
   const userId = params.get("userId");
   if (userId === null) {
