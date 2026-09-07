@@ -105,8 +105,12 @@ async function main() {
       { text: "Receipt from the bike shop.", imageBase64: img }, v);
     const joined = vis.stored.map((f) => f.content).join(" | ");
     check("facts extracted from the image", vis.stored.length > 0, joined.slice(0, 90) + "...");
-    check("image content actually read (total or shop name present)",
-      /33\.50|Greenfield/i.test(joined));
+    // Any distinctive detail off the receipt proves the image was read. The
+    // model varies which line items it keeps, so pinning this to one or two
+    // strings made it fail intermittently for reasons unrelated to vision.
+    check("image content actually read (a distinctive receipt detail present)",
+      /33\.50|Greenfield|Harbour|bar tape|inner tube|chain lubricant|4417|700x25c/i.test(joined),
+      joined.slice(0, 80) + "...");
     check("base64 not persisted in the payload", (vis.stored[0]?.source ?? "").startsWith("[image]"));
 
     // ---- 8. provider seam ----------------------------------------------

@@ -28,6 +28,8 @@ export interface MemoryRecord {
   extractedAt: string;
   supersededMemoryId: string | null;
   superseded: boolean;
+  /** This memory supersedes something chronologically newer than itself. */
+  outOfOrder: boolean;
 }
 
 export interface SearchResult {
@@ -38,6 +40,8 @@ export interface SearchResult {
   // What this fact itself superseded, and whether a newer fact has superseded it.
   supersededMemoryId: string | null;
   superseded: boolean;
+  /** This memory supersedes something chronologically newer than itself. */
+  outOfOrder: boolean;
   cosineScore: number;
   bm25RawScore: number | null;
   bm25Normalized: number | null;
@@ -55,6 +59,10 @@ export interface StoredFact {
   // The id of the memory this fact supersedes. The superseded point is left in
   // the collection; search() hides it by default instead of deleting it.
   supersededMemoryId: string | null;
+  // True when the supersede link points at a CHRONOLOGICALLY NEWER memory — a
+  // backfill that arrived late. The link is kept for lineage, but an
+  // out-of-order fact never hides the fact it claims to replace.
+  outOfOrder: boolean;
 }
 
 export interface SkippedFact {

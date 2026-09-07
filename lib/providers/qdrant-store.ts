@@ -9,7 +9,7 @@ import type {
   VectorStoreClient,
 } from "./types";
 
-type QdrantCondition = { key: string; match: { value: string } | { any: string[] } };
+type QdrantCondition = { key: string; match: { value: string | boolean } | { any: string[] } };
 
 function toQdrantCondition(c: FieldCondition): QdrantCondition {
   return "anyOf" in c

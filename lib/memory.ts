@@ -74,6 +74,14 @@ async function embed(text: string): Promise<number[]> {
 
 interface RelatedMemoryInternal extends RelatedMemory {
   id: string;
+  observedAt: string | null;
+}
+
+// Where a memory sits in time: when it was observed if the caller said so,
+// otherwise when it was written. This is what decides whether a candidate
+// supersede is a genuine update or a late-arriving backfill.
+function effectiveTimestamp(observedAt: string | null, extractedAt: string): string {
+  return observedAt ?? extractedAt;
 }
 
 async function findRelated(text: string, scope: ValidatedScope): Promise<RelatedMemoryInternal[]> {
@@ -90,6 +98,8 @@ async function findRelated(text: string, scope: ValidatedScope): Promise<Related
     source: String(point.payload?.source ?? ""),
     score: point.score,
     extractedAt: String(point.payload?.extractedAt ?? ""),
+    observedAt:
+      typeof point.payload?.observedAt === "string" ? point.payload.observedAt : null,
   }));
 }
 
@@ -100,8 +110,14 @@ async function findSupersededIds(
   if (ids.length === 0) return new Set();
   const base = scopeFilter(scope);
   const superseded = new Set<string>();
+  // A fact is hidden only by a superseder that is chronologically later or equal.
+  // That comparison is made once, at write time, and recorded as outOfOrder — so
+  // excluding those points here is equivalent to re-comparing timestamps on every
+  // read, without fetching two timestamps per candidate. Points written before
+  // this field existed have no value and are correctly treated as in-order.
   const filter: MemoryFilter = {
     must: [...(base.must ?? []), { key: "supersededMemoryId", anyOf: ids }],
+    mustNot: [{ key: "outOfOrder", equals: true }],
   };
   for await (const page of store.scroll(filter, SCROLL_PAGE_SIZE, {
     payloadFields: ["supersededMemoryId"],
@@ -274,6 +290,16 @@ export async function add(
     // filtered out at read time, so the history is recoverable rather than gone.
     const supersededMemoryId = target ? target.id : null;
 
+    // The extraction model only proposes a CANDIDATE link. Whether that link
+    // actually invalidates the older memory is decided here, deterministically,
+    // by comparing positions in time — not by the model, and not by write order.
+    // A fact that arrives late may record the link for lineage, but it must not
+    // hide a memory that is chronologically newer than itself.
+    const outOfOrder =
+      target !== undefined &&
+      effectiveTimestamp(observedAt, extractedAt) <
+        effectiveTimestamp(target.observedAt, target.extractedAt);
+
     const vector = await embed(fact.content);
     const id = randomUUID();
     await store.upsert([
@@ -287,6 +313,7 @@ export async function add(
           observedAt,
           type: "fact",
           supersededMemoryId,
+          outOfOrder,
           userId: validatedScope.userId,
           agentId: validatedScope.agentId,
           runId: validatedScope.runId,
@@ -308,7 +335,10 @@ export async function add(
         : { memoryId: id, event: "ADD", oldContent: null, newContent: fact.content, scope: validatedScope }
     );
 
-    stored.push({ id, content: fact.content, source: sourceText, extractedAt, observedAt, supersededMemoryId });
+    stored.push({
+      id, content: fact.content, source: sourceText, extractedAt, observedAt,
+      supersededMemoryId, outOfOrder,
+    });
     dedupMap.set(hash, { id, content: fact.content });
   }
 
@@ -353,6 +383,7 @@ export async function search(
       typeof point.payload?.supersededMemoryId === "string"
         ? point.payload.supersededMemoryId
         : null,
+    outOfOrder: point.payload?.outOfOrder === true,
     cosineScore: point.score,
   }));
 
@@ -385,6 +416,7 @@ export async function search(
       extractedAt: c.extractedAt,
       supersededMemoryId: c.supersededMemoryId,
       superseded: supersededIds.has(c.id),
+      outOfOrder: c.outOfOrder,
       cosineScore: c.cosineScore,
       bm25RawScore,
       bm25Normalized,
@@ -425,6 +457,7 @@ export async function getAll(
           typeof point.payload?.supersededMemoryId === "string"
             ? point.payload.supersededMemoryId
             : null,
+        outOfOrder: point.payload?.outOfOrder === true,
         superseded: false,
       });
     }

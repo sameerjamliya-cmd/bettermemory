@@ -5,7 +5,7 @@
 /** A single field condition. Deliberately smaller than any one vendor's filter
  *  DSL — it covers exactly what the orchestration layer actually needs. */
 export type FieldCondition =
-  | { key: string; equals: string }
+  | { key: string; equals: string | boolean }
   | { key: string; anyOf: string[] };
 
 export interface MemoryFilter {
