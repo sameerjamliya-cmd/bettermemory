@@ -1,435 +1,72 @@
-# Personal Memory Layer
-
-A memory layer for AI agents, built from scratch to understand how systems
-like mem0 actually work — not a production system, a learning project
-where every feature exists because a real failure justified it.
-
-Stack: Next.js/TypeScript, Qdrant, OpenAI (embeddings + extraction).
-
-## Philosophy
-
-Most of this wasn't designed upfront. It started as the dumbest possible
-pipeline — raw extraction, no dedup, no conflict handling — and every
-addition below was built only after that pipeline broke in an observable,
-reproducible way. Where a design choice diverges from mem0 (which was read
-directly from source throughout this project, not just its docs), that's
-noted.
-
-## Phase 1 — Extraction and Conflict Resolution
-
-Started bare: one LLM call, no rules. Immediately broke — a deadlift PR
-updated from 140kg to 145kg and both facts sat in the store, nearly tied
-in cosine similarity (0.7300 vs 0.7275). Pure semantic search cannot tell
-you what's currently true, only what's textually similar to a query.
-
-Built in response:
-- Context-aware extraction — existing related memories are retrieved first
-  and passed into the extraction call as labeled ids (`"0"`, `"1"`, …), so
-  the model can reason about what it already knows
-- Two-layer dedup — semantic (LLM judgment against existing memories) +
-  a hash-based exact-match backstop over normalized content
-- Explicit `skip: true` reporting so semantic dedup is auditable, not a
-  silent omission: every skip surfaces in `AddResult.skipped` with a
-  `reason` of `semantic_dedup` or `hash_dedup` and the memory it matched
-- Anti-hallucination rules, added after the model invented a deadlift
-  number ("past 145" became "150kg") and separately inflated a tentative
-  claim ("learning Rust") into a strong one ("favorite language")
-- A vague-update safety rail — an update only overwrites an existing fact
-  if it's at least as specific; otherwise it's stored separately, so a
-  vague follow-up can never destroy a specific fact
-
-## Phase 2 — Retrieval and Scoping
-
-- Scoping (`userId`/`agentId`/`runId`) enforced at the Qdrant query level,
-  not as an application-side filter — a scoped search cannot see another
-  scope's data even indirectly. Scope ids are validated and normalized at
-  the entry point of every public function, and the internal helpers accept
-  a distinct `ValidatedScope` type, so unvalidated input cannot reach a
-  query by construction
-- BM25 keyword search added alongside cosine similarity, sigmoid-normalized
-  (midpoint 5, steepness 0.5) and fused via an adaptive divisor — the score
-  is the mean of however many signals were actually available, so a fact
-  with no keyword overlap is not penalized against one that has it
-  (inspired by mem0's `score_and_rank`, reasoned through independently
-  before comparing against theirs)
-- Entity linking was deliberately tested, not assumed necessary: three
-  topically unrelated facts sharing only a name ("Sameer") were all
-  correctly retrieved by a query about that name — BM25's exact-keyword
-  matching did the job entity linking exists for in mem0, so it wasn't built
-
-## Phase 3 — Conflict Resolution Redesign, and Store Management
-
-Originally, updates deleted the old fact outright (`replaces`). That made
-every skip-vs-update judgment call destructive — and testing showed the
-model would sometimes misclassify a reworded duplicate as an update.
-Rather than keep fighting that judgment call with prompt engineering, the
-architecture changed: updates now link to and hide the old fact
-(`supersedes`) instead of deleting it. A wrong classification now costs
-nothing destructive — this mirrors mem0's actual `linked_memory_ids`
-design, but adds the automatic read-time filtering mem0 itself is
-missing (its `expiration_date` field exists but nothing sets it
-automatically).
-
-Concretely: the extraction model returns `supersedes: "<label>" | null`, and
-a superseding fact is stored with a `supersededMemoryId` payload field
-pointing at the memory it replaces. The old point stays in the collection.
-`search()` runs a second pass that excludes any candidate another point
-claims to supersede, and takes an optional `includeSuperseded` flag
-(default `false`) to look at the history deliberately — mirroring the
-visibility mem0 keeps via `show_expired`.
-
-Also added:
-- `getAll(scope, options?)` — full, unranked listing of a scope's memories,
-  sorted newest-first by `extractedAt`, paginated to handle collections
-  larger than one Qdrant scroll page (100 points)
-- `deleteMemory(id, scope)` — manual removal, scope-enforced, with dangling
-  `supersededMemoryId` references cleaned up on delete. Also exported as
-  `delete` (`import * as memory` → `memory.delete(...)`), since `delete` is
-  a reserved word and cannot be a function declaration name. Returns a
-  discriminated result (`deleted` / `not_found` / `scope_mismatch`) rather
-  than throwing; a cross-scope refusal deliberately returns only the id, so
-  the error path can't be used to read another scope's content
-- Fixed a branching-supersession edge case: the supersession lookup capped
-  its scroll at the number of ids it was asked about, which assumed each id
-  had at most one superseder. When several memories independently supersede
-  the same original, the matches can outnumber the ids and a stale fact
-  could leak into results. Now paginated instead. In practice this was only
-  reachable through `search()` on a scope larger than the 20-point candidate
-  pool — `getAll()` was structurally immune, since its id set is the whole
-  scope
-
-## Testing
-
-`npm run test:suite` runs an 11-case regression suite against a live Qdrant
-and the real extraction model. Each run namespaces its scopes under a
-timestamped prefix and deletes exactly what it wrote, so repeated runs never
-pollute each other or touch real data.
-
-The cases cover: hash dedup, paraphrase handling, supersession on a genuine
-update, the vague-update safety rail, branching supersession, scope
-isolation, scope hierarchy (a broad scope reads and deletes narrow-scoped
-points while cross-user deletion stays refused), chained supersession
-(A→B→C leaves only C visible), deleting a successor to un-hide its original,
-anti-hallucination, and BM25's contribution to ranking.
-
-The paraphrase case is deliberately written to tolerate model
-nondeterminism: it passes whether the model skips the restatement or treats
-it as an update, but fails if the fact is lost or duplicated — because under
-link-don't-delete, both classifications are safe and only loss is a bug.
-
-`npm run test:extraction` is a separate, non-gating measurement of
-extraction quality on scenarios where the model's judgement genuinely
-varies between runs. It reports pass RATES over N attempts (default 6,
-override with `ATTEMPTS`) and always exits 0. These live outside the suite
-on purpose: at the measured rate for the harder case, any pass/fail
-threshold fails more often than it succeeds, which would make the suite a
-coin flip rather than a contract. A rate that drops across several runs is
-the signal to investigate.
-
-Current baseline on `gpt-4o-mini`, one message updating two facts at once:
-
-| Scenario | Rate |
-| --- | --- |
-| `3b-explicit` — clear departure signal ("relocated to", "switched to") | 6/6 |
-| `3b-ambiguous` — no departure signal ("stayed in", "also started at") | 0/6 |
-| `3c` — dimensions with no worked example (relationship + habit) | ~50% |
-
-The first two were previously one blended number, and splitting them is what
-made the result interpretable. The dominant factor in whether an update links
-turned out not to be the dimension or how well the prompt demonstrates it, but
-whether the message signals that the **old fact stopped holding**. Measured in
-isolation against the same stored job fact, "I started at a logistics company"
-links 0/5, while "I switched to", "I left X and started at Y" and "I now work
-at" each link 5/5 — and the same holds in reverse for location, where
-"I relocated to Hyderabad" links 5/5 but "I stayed in Hyderabad this week"
-links 0/5.
-
-So `3b-ambiguous` scoring 0 is not a defect. "I also started at a logistics
-company" does not assert the previous job ended — people hold two jobs — and
-superseding there would hide a fact the user never retracted. A *high* rate on
-that row would be the worse outcome. `3b-explicit` is the real capability
-measure and should stay high.
-
-These figures replace an earlier, higher baseline (~85% / ~40-65%) that was
-partly measuring prompt contamination rather than reasoning. Several prompt
-examples used the same concrete values as the test inputs — the
-anti-hallucination example contained `145kg`, which is the exact number the
-anti-hallucination test asserts on, and the vague-update, location, possession
-and coreference examples reused `80kg`, Chennai/Bangalore, Honda/Tesla and a
-person's name that the tests also used. Those examples now use bracketed
-placeholders (`[N]kg`, `[CITY_NEW]`, `[PERSON]`), so a value echoed from an
-example is immediately visible in output instead of looking plausible. The
-numbers moved when the contamination was removed; the earlier ones were not a
-like-for-like better result.
-
-`npm run test:memory` is an interactive console for manual exploration:
-add sentences one per line, then `list` / `list all` to see the scope,
-`delete <id>` to remove a memory, and a search query at the end.
-
-## Procedural memory
-
-Facts describe the user; procedural memories are instructions the agent should
-follow. They live in the same collection, separated by a `type` payload field,
-and travel a deliberately minimal path:
-
-- `addProcedural(instruction, scope)` stores the text **verbatim** — no
-  extraction call, no dedup, no supersession. Rewriting an instruction risks
-  changing what it tells the agent to do, and two similar instructions are not
-  necessarily redundant, so neither mechanism is a safe default here.
-- `getProcedural(scope)` returns all of them, newest first, unranked and
-  paginated. There is no query to score them against: instructions are to be
-  followed, not matched.
-- `search()`, `getAll()` and the extraction context inside `add()` all exclude
-  `type: "procedural"` at the Qdrant query level, so instructions never appear
-  as facts and never become source material for extraction.
-- `deleteMemory()` needed no changes and works on them unmodified, with the
-  same scope enforcement.
-
-Points written before `type` existed carry no such field. The exclusion filter
-uses `must_not` on the procedural value rather than requiring `type: "fact"`,
-so legacy points stay visible — a missing field cannot match.
-
-## Event log and history()
-
-`history(id, scope)` reads from an **append-only event log**, not from the live
-memories. Every insert, supersede and delete appends a row:
-
-```
-MemoryEvent { id, memoryId, event: "ADD" | "SUPERSEDE" | "DELETE",
-              oldContent, newContent, supersedesMemoryId, createdAt, scope }
-```
-
-**Why this replaced the previous design.** History used to be reconstructed by
-walking `supersededMemoryId` across the live points. That works right up until
-someone deletes a memory the chain depends on — delete the root of an A -> B -> C
-chain and its content is simply gone, so the lineage can no longer be told. The
-log is never touched by deletes, so the same query still answers, and
-`history()` now resolves even for a memory that no longer exists.
-
-**Where it lives: SQLite, via Node's built-in `node:sqlite`**
-(`logs/memory-events.db`). The alternatives were worse fits: a second Qdrant
-collection would need a dummy vector per event and a network round-trip per
-write, for weaker queries than a local index; the existing JSONL logger is
-append-only but unindexed and has no notion of scope or event types.
-`node:sqlite` ships with Node 22+, so this adds a real indexed store with **no
-new dependency and no native build**, and it matches what mem0 uses for its own
-history table. It is still flagged experimental in Node, which is why it is
-isolated behind `lib/events.ts` — swapping in `better-sqlite3` would touch
-nothing else.
-
-`lib/events.ts` contains only `INSERT` and `SELECT`. There is deliberately no
-update or delete path, so removing a memory can never remove its history.
-
-One schema addition beyond mem0's shape: `supersedesMemoryId`. Content alone
-cannot identify a predecessor, so without it a chain could not be walked once
-its earlier links were deleted — the exact case this rebuild exists to serve.
-
-## API and dashboard
-
-Three thin Next.js routes wrap the library, plus a view-only page at
-`/dashboard` for inspecting a scope and running searches:
-
-| Route | Body / params |
-| --- | --- |
-| `POST /api/memory/add` | `{ text, scope, options? }` (or `imageBase64`) |
-| `POST /api/memory/search` | `{ query, scope }` |
-| `GET /api/memory/all` | `?userId=&agentId=&runId=&includeSuperseded=` |
-
-The routes duplicate no validation: scope and input checks come from
-`add()`/`search()`/`getAll()` themselves, and a thrown `Invalid ...` becomes a
-400.
-
-### Authentication
-
-Every route under `/api/memory/*` requires a bearer token:
-
-```
-Authorization: Bearer <API_KEY>
-```
-
-Set `API_KEY` in `.env.local`, generating a real secret rather than shipping the
-placeholder:
-
-```bash
-openssl rand -hex 32
-```
-
-```bash
-curl -H "Authorization: Bearer $API_KEY" \
-     "http://localhost:3000/api/memory/all?userId=sameer"
-
-curl -X POST http://localhost:3000/api/memory/add \
-     -H "Authorization: Bearer $API_KEY" \
-     -H 'Content-Type: application/json' \
-     -d '{"text":"My current city is Chennai.","scope":{"userId":"sameer"}}'
-```
-
-A missing key, a wrong key and a wrong scheme all return an identical **401** —
-distinguishing them would tell an attacker which part they got right. The check
-runs before any body parsing, scope validation or memory logic. Comparison is
-constant-time.
-
-The routes **fail closed**: if `API_KEY` is unset the API returns 500 rather
-than serving unauthenticated requests, so a missing config cannot quietly become
-an open deployment.
-
-The dashboard calls the library through **server actions**, not the HTTP API, so
-the key is never sent to the browser — verified: it appears in neither the
-rendered HTML nor any client JS chunk. The trade-off is that the dashboard does
-not exercise the bearer check; that path is covered by tests against the routes
-directly.
-
-> **⚠️ The API key controls who may call the API. It does not add per-user
-> isolation.**
-> `userId` remains an identifier, not a credential: any caller holding the key
-> can read and write *any* scope by naming it. Scoping separates data; it does
-> not authenticate the person asking. Multi-tenant use would need per-user
-> credentials and authorisation on every scope parameter, plus rate limiting —
-> none of which exist. Treat the key as a single trusted-operator secret.
-
-## Known limitations (deliberately deferred, not overlooked)
-
-Consolidated here rather than scattered across commits. Numbers are measured,
-not estimated — reproduce them with `npm run test:extraction`.
-
-**Extraction quality (stochastic, model-dependent)**
-
-Measured on `gpt-4o-mini`, one message updating two facts at once:
-
-| Scenario | Rate |
-| --- | --- |
-| `3b-explicit` — clear departure signal ("relocated to", "switched to") | 6/6 |
-| `3b-ambiguous` — no departure signal ("stayed in", "also started at") | 0/6 |
-| `3c` — dimensions with no worked example (relationship + habit) | 3/6 to 6/6 across runs |
-
-- **`3b-ambiguous` scoring 0 is the defensible outcome, not a bug.** "I also
-  started at a logistics company" does not assert the previous job ended, so
-  superseding would hide a fact the user never retracted. A *high* rate on that
-  row would be worse.
-- **The job-role exclusivity rule is a tracked candidate, deliberately not
-  implemented.** Stating in the prompt that mentioning a new employer/home/partner
-  without indicating the previous one ended is not a supersede would make the
-  behaviour deliberate rather than emergent, at the risk of over-suppressing
-  legitimate updates. It needs measuring before adoption.
-- **`3c` varies run to run.** Gains from worked examples are per-dimension rather
-  than cumulative, so an example-per-dimension arms race scales badly. A stronger
-  extraction model closes much of the gap at roughly 10x per-token cost.
-- **Pure rewords** are sometimes classified as updates rather than duplicates.
-  Three prompt revisions failed to fix it; accepted because link-don't-delete
-  makes the consequence mild (id churn, no data loss).
-
-**Retrieval**
-
-- **No associative retrieval.** Every memory is scored independently against the
-  query, so a fact reachable only *through* another fact is unreachable. Confirmed
-  by ablation: two linked facts sharing no vocabulary score bit-for-bit
-  identically whether or not the other is present. A mechanism
-  (`associatedMemoryIds` + an opt-in `expandAssociations`) is designed and
-  deliberately not built — the diagnostics justified it, the cost/benefit was not
-  yet worth it.
-- **No memory strength or importance weighting.** Ranking is similarity only.
-  Measured: asked "anything significant lately", a new job ranked *below*
-  restocking a fridge and sorting a sock drawer, with the whole field spanning
-  ~0.02 of combined score. Nothing encodes that some memories matter more.
-- **No reconsolidation.** Memories are never revised, merged, or strengthened by
-  being retrieved or re-encountered — retrieval is read-only, and a fact restated
-  ten times is identical to one stated once.
-- **`findRelated()` does not filter superseded facts**, so the extraction model
-  can see stale versions when deciding what to supersede.
-- **`search()` does not validate its query string** the way `add()` validates its
-  input text.
-
-**Infrastructure**
-
-- **The API has no authentication** — see the warning above. Localhost only.
-- **The provider seam has exactly one real implementation of each interface.**
-  `VectorStoreClient` and `LLMClient` exist and are proven by an in-memory mock
-  (`add()` → `search()` round-trip with no network), but the only production
-  implementations are Qdrant and OpenAI. The abstraction is real; the portability
-  is unproven against a second vendor, and a second vendor would likely surface
-  assumptions the mock does not.
-- **Temporal grounding is approximate.** `observedAt` resolves relative references
-  ("last week") against the observation date rather than now, but resolution
-  succeeds roughly two times in three and produces week-granular dates.
-- **The extraction model occasionally links two unrelated facts as an update.**
-  A bench-press fact superseding a squat fact, for example, which hides the
-  squat fact from default retrieval. This is a standing defect of the
-  extraction step, measured at roughly 1-7% of calls on the scenario used to
-  probe it (`scripts/` is not wired to test it; the suite's BM25 case fails
-  intermittently when it fires). It is the one behaviour here that can hide a
-  user's data without being asked to, and it is not fixed.
-
-  It was **investigated thoroughly and found NOT to be caused by the temporal
-  grounding prompt block**, contrary to an initial n=50 reading. Full history,
-  same methodology throughout (50 trials of "My squat PR is 90kg." followed by
-  "My bench PR is 90kg.", counting how often the second superseded the first):
-
-  | Arm | Rate |
-  | --- | --- |
-  | n=50, no temporal block | 0/50 |
-  | n=50, temporal block (original wording) | 3/50 |
-  | n=50, same-length neutral filler block | 0/50 |
-  | n=50, temporal block (narrowed wording) | 2/50 |
-  | **n=150, temporal block (as shipped)** | **2/150 (1.3%)** |
-  | **n=150, temporal block removed** | **11/150 (7.3%)** |
-
-  At n=150 the difference is statistically significant (Fisher's exact,
-  two-tailed, p = 0.020) but points the **opposite way** from the n=50 study —
-  the arm *with* the temporal block had the lower defect rate. Pooling every
-  arm ever run (7/250 with the block, 11/250 without) gives p = 0.472. A
-  reversal of direction between two studies using identical methodology is
-  evidence of an uncontrolled, time-varying factor — the arms ran at different
-  times, and provider-side behaviour drifted noticeably over the session — not
-  of a prompt effect in either direction.
-
-  **Conclusion: the temporal block does not cause this defect.** The defect is
-  real, pre-existing, and independent of it. Fixing it (tightening the
-  supersede rule further, or moving the extraction decision off `gpt-4o-mini`)
-  is a deliberate future decision, not something to rush.
-
-**A correction worth recording**
-
-Feature #3 (usage notices) was originally understood as simple UX tips, by
-analogy with a `notices.py` in mem0. That reading was wrong: mem0's is a
-**commercial feature-gating system** — it decides what to advertise and gate
-based on account state. What is implemented here is a deliberately simpler,
-honest reimplementation of the *idea* of a proactive notice (first-run and
-scale-threshold messages computed locally, returned in `AddResult.notice`, with
-no telemetry and nothing leaving the system). It is not a port of theirs, and
-should not be described as parity with it.
+# bettermemory
+
+A memory layer for AI agents, built from scratch — not to ship a product, but to understand how systems like mem0 actually work by reading their source, testing every design decision, and fixing what broke.
+
+Stack: Next.js/TypeScript, Qdrant, OpenAI (embeddings + extraction, vision).
+
+## The approach
+
+Every feature here exists because a real, reproducible failure justified it — not because a reference system has it. Where mem0 or Graphiti (Zep's temporal graph engine) were used as reference points, their actual source was read directly, not their docs or marketing — and in several cases, that surfaced real gaps in *their* systems, or proved a feature they have isn't needed here at all.
+
+This shows up in the numbers: stochastic behaviors are tracked as measured rates with real sample sizes, not pass/fail claims. When an early test read 6/6, it got re-measured before being trusted — one turned out to be partly grading a model on an answer sitting in its own prompt.
+
+## What was learned from mem0 (and what wasn't copied)
+
+Read directly from `mem0ai/mem0`'s source, not its docs:
+
+- **Two-layer dedup** (semantic LLM judgment + hash backstop) — adopted, with full observability added (mem0's own dedup is a silent omission you can't audit)
+- **Link, don't delete, on update** — mem0's `linked_memory_ids` design was adopted deliberately after finding their actual `_add_to_vector_store` still supports outright deletion by default. This project's version also closes a real gap mem0 has: `expiration_date` exists in their schema but nothing in their code ever sets it — this project's `supersedes` mechanism does both halves, linking *and* automatically hiding at read time
+- **BM25 + cosine fusion** — mem0's adaptive-divisor formula and query-length-tuned sigmoid parameters were read from `scoring.py` and tested directly against this implementation's own BM25. The tuning table didn't transfer: this system's raw BM25 scores don't scale with query length the way mem0's do (a 2-term query scored 3.22 raw where an 18-term query scored 3.74 — barely more), so adopting their constants would have suppressed keyword matching for no reason. Checked, not needed.
+- **Entity linking, graph memory** — tested with adversarial scenarios designed to isolate real association from lexical coincidence (four rounds of test design, each round finding a hidden flaw in the last). Verdict: not needed for the cases tested — BM25 and embedding proximity already handle them. The one genuine gap found is recorded under limitations below.
+- **`notices.py`** — inspired an early "usage notices" feature before actually reading the source, which turned out to be commercial feature-gating and telemetry, not UX tips. Corrected: this project's notices are a simpler, honest reimplementation, not a port
+- **`storage.py`** — reading mem0's real `history()` (a true append-only SQLite log) revealed this project's first `history()` implementation had a real gap: it was reconstructed from live data and would break if a root memory in a chain was ever deleted. Rebuilt as an independent event log that survives deletion of what it references.
+
+## What was learned from Graphiti (Zep's temporal graph engine)
+
+Read `getzep/graphiti`'s source specifically to address an unresolved bug in this project's own supersede logic. The key finding: Graphiti splits the *decision* into two separate steps — an LLM identifies candidate relationships (semantic judgment), then **pure deterministic date comparison** decides whether to actually invalidate, with the model never touching that half.
+
+This system now uses the same split:
+
+- **Timestamp gate** — a fact can no longer be silently overwritten by something chronologically older just because it was *written* second (`observedAt`-aware, catches out-of-order backfills). The link is still recorded for lineage, flagged `outOfOrder`, but it never hides the newer fact.
+- **Attribute-key gate** — a fact can no longer be superseded by something the model *thinks* is related but is actually a different underlying attribute (fixed a real, reproducible bug: "bench PR" was hiding "squat PR" 7% of the time, purely on semantic over-matching, unrelated to timing)
+
+## The bug that mattered
+
+A wrong-supersede defect — the only bug in this project that could **silently hide true data** — was found, reproduced at a measured 7/100 rate, and traced to its exact cause: the extraction model treating two different lift types as "the same fact, updated," because both matched the shape `"[exercise] PR is [n]kg"`.
+
+Getting there took discipline. An earlier n=50 study appeared to blame an unrelated prompt addition (0/50 vs 3/50); re-run at n=150 per arm, the effect *reversed* (11/150 vs 2/150, p = 0.02) — a direction flip under identical methodology, which is the signature of an uncontrolled variable, not a cause. A same-length neutral filler block scoring 0/50 had already ruled out prompt length. The suspected culprit was cleared, and the real one only surfaced once concrete failure examples were captured rather than aggregate rates.
+
+The fix (a deterministic `attributeKey` gate, Graphiti-inspired) was built, and its first version introduced the exact regression that was flagged as a risk before building it — a legitimate job-role update got silently blocked because the model split one life dimension into two attribute names (`current_job_title` vs `current_employer`), leaving two contradictory job facts live. Caught by the regression suite, fixed by asking for the coarsest attribute grouping that still separates genuinely different facts, and reverified: the bug closed to 0/100 without breaking any of the four known-good supersession cases.
+
+## Features
+
+- Context-aware extraction with anti-hallucination and coreference-resolution guards, each added after observing the model do the specific thing they now prevent
+- Two-layer dedup, fully observable
+- Link-based supersession with deterministic timestamp and attribute gates
+- Hierarchical scoping (`userId`/`agentId`/`runId`), enforced at the database query level throughout — including a caught asymmetry where memories were readable but not deletable through the same scope
+- Hybrid BM25 + cosine retrieval
+- Procedural memory (standing instructions, separate from fact retrieval)
+- Custom per-call extraction instructions, with adversarial testing confirming they can't bypass the structural safety rules
+- Temporal grounding (`observedAt`) for backfilling historical data
+- Vision (image → extracted facts)
+- Append-only event log (SQLite via Node's built-in `node:sqlite`), so `history()` survives deletion of what it describes
+- Provider-agnostic seam for the vector store and LLM, proven by an in-memory mock that runs `add()` → `search()` with no network
+- Minimal REST API + dashboard, with API-key auth
+- mem0 method parity: `add`, `search`, `get`, `getAll`, update (via supersede), `delete`, `deleteAll`, `reset`, `history` — `chat()` excluded, since it's an unimplemented stub in mem0 itself
+
+Tests: `npm run test:suite` (11 deterministic cases), `test:e2e` (27 checks across every feature in one session), `test:providers` (mock providers, no network), `test:extraction` (stochastic rates, non-gating).
+
+## Known limitations — stated honestly, not omitted
+
+- **Multi-dimension update linking is stochastic**, not solved: 6/6 on demonstrated patterns with an explicit departure signal (e.g. "switched to"), 0/6 by design on ambiguous ones with no such signal (correct behavior — the model rightly declines to infer an ending that wasn't stated), ~6/6 on undemonstrated dimensions after prompt tuning. Real, measured numbers — not the early inflated 6/6 that turned out to be partly measuring prompt contamination.
+- **A job-role exclusivity rule** was identified as a real fix but never built — tracked as an open candidate requiring its own dedicated test.
+- **The `attributeKey` gate only protects memories written after it existed.** A candidate with no stored key is treated as unknown rather than mismatched, so the link is allowed through — a deliberate choice, since treating "missing" as "different" would have silently broken every update against pre-existing data.
+- **Retrieval has no associative expansion.** Confirmed by ablation, not assumed: two linked facts sharing no vocabulary score bit-for-bit identically whether or not the other is present, so a fact reachable *only* through another fact is unreachable. A mechanism was designed and deliberately not built.
+- **No usage-based decay or reinforcement** (a memory's rank never adapts to how often it's retrieved) — scoped, deliberately deferred. Measured consequence: asked "anything significant lately", a new job ranked *below* restocking a fridge.
+- **No reconsolidation** (retrieval never mutates a memory, unlike human recall) — flagged from the start as too structurally risky, since every safety guarantee in this project assumes reads are non-destructive.
+- **Provider-agnostic seam exists but is proven against only one real implementation** (Qdrant + OpenAI) — the abstraction is real (verified via a mock provider), not battle-tested against a second vendor.
+- **The API key gates who may call the API; it does not isolate one user from another.** `userId` is an identifier, not a credential: any caller holding the key can address any scope. Multi-tenant use would need per-user credentials and authorisation on every scope parameter.
 
 ## Setup
 
-Requires Node 18+ and Docker.
-
-```bash
-# 1. Start Qdrant (stores data in a named Docker volume, qdrant_storage)
-docker compose up -d
-
-# 2. Install dependencies
-npm install
-
-# 3. Configure credentials
-cp .env.example .env.local
-# then set OPENAI_API_KEY in .env.local
-
-# 4. Verify the whole pipeline against live Qdrant + OpenAI
-npm run test:suite
-```
-
-`.env.local` is gitignored and never committed.
-
-| Command | What it does |
-| --- | --- |
-| `npm run test:suite` | 11-case regression suite, self-cleaning |
-| `npm run test:e2e` | One session exercising every feature in sequence (26 checks) |
-| `npm run test:providers` | Provider seam against in-memory mocks — no network, no API key |
-| `npm run test:extraction` | Extraction-quality rates (non-gating, always exits 0) |
-| `npm run test:memory` | Interactive console (add / list / delete / search) |
-| `npm run dev` | Next.js dev server |
-
-Configuration lives in [`lib/clients.ts`](lib/clients.ts): collection
-`memory_facts`, embeddings `text-embedding-3-small` (1536 dims), extraction
-`gpt-4o-mini`. Every `add`/`search`/`getAll`/`delete` call is appended to
-`logs/memory.log.jsonl` with its full input and output, which is how most of
-the failures above were diagnosed after the fact.
+See [QUICKSTART.md](./QUICKSTART.md).
